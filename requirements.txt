@@ -5,3 +5,4 @@ pydantic[email]>=2.8
 psycopg[binary]>=3.2
 python-dotenv>=1.0
 alembic>=1.13
+openai>=1.40

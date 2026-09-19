@@ -3,7 +3,7 @@ from typing import Optional
 
 from pydantic import BaseModel, EmailStr, Field
 
-from app.models import FriendStatus
+from app.models import FriendStatus, IngredientStatus
 
 
 # ---------- User ----------
@@ -92,3 +92,42 @@ class FriendWithUser(FriendRead):
     """The friendship row plus the *other* user's profile."""
 
     friend: UserRead
+
+
+# ---------- FavoriteFood / onboarding ----------
+class IngredientRead(BaseModel):
+    name: str
+    category: str
+    essential: bool
+
+
+class FavoriteFoodCreate(BaseModel):
+    """What the onboarding screen sends when the user confirms their picks."""
+
+    foods: list[str] = Field(min_length=1, max_length=20)
+
+
+class FavoriteFoodRead(BaseModel):
+    id: int
+    user_id: int
+    name: str
+    cuisine: Optional[str]
+    ingredients: list[IngredientRead]
+    ingredient_status: IngredientStatus
+    ingredient_error: Optional[str]
+    ingredients_updated_at: Optional[datetime]
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class OnboardingResult(BaseModel):
+    """Outcome of confirming the onboarding screen."""
+
+    saved: list[FavoriteFoodRead]
+    skipped: list[str] = Field(
+        default_factory=list, description="Foods this user had already saved"
+    )
+    ingredients_pending: int = Field(
+        description="How many foods are having their ingredients looked up in the background"
+    )

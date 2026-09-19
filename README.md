@@ -32,6 +32,7 @@ pytest     # always runs on in-memory sqlite, never touches your real DB
 | `User` | `id`, unique `email`, `name`, `created_at` — table is `app_user`, since `user` is reserved in Postgres |
 | `GroceryItem` | belongs to one user; `expires_on`, `consumed`, `quantity`/`unit`, `category` |
 | `Friend` | association entity between two users: `user_id`, `friend_id`, `status` (`pending`/`accepted`/`blocked`) |
+| `FavoriteFood` | a food the user picked at onboarding + its LLM-generated `ingredients` (JSONB), with `cuisine` and an `ingredient_status` |
 
 A friendship pair is stored **once**, in whichever direction it was requested;
 `status` is what makes it mutual. Deleting a user cascades to their items and
@@ -63,6 +64,57 @@ curl "localhost:8000/users/1/grocery-items/expiring?within_days=5&include_friend
 `GET /users/{user_id}/friends?status=accepted`,
 `PATCH /users/{user_id}/friends/{friend_id}` (accept/block),
 `DELETE /users/{user_id}/friends/{friend_id}`
+
+## Onboarding & ingredients
+
+The onboarding screen sends the foods the user picked:
+
+```bash
+curl -X POST localhost:8000/users/1/favorite-foods \
+     -H 'content-type: application/json' \
+     -d '{"foods": ["Pad Thai", "Jollof Rice"]}'
+```
+
+It returns **202** immediately with each food `pending`. The ingredient lookup
+runs in the background and the client polls `GET /users/1/favorite-foods` until
+`ingredient_status` becomes `ready`:
+
+```json
+{ "name": "Pad Thai", "cuisine": "Thai", "ingredient_status": "ready",
+  "ingredients": [{"name": "rice noodles", "category": "grain", "essential": true}] }
+```
+
+Endpoints: `POST|GET /users/{id}/favorite-foods`,
+`POST /users/{id}/favorite-foods/{food_id}/refresh-ingredients` (retry a
+`failed` row), `DELETE /users/{id}/favorite-foods/{food_id}`.
+
+**Why the lookup is not inline.** These models can take a minute or more, and
+an onboarding request that blocks that long times out at proxies and load
+balancers. So the picks are committed first and enriched after: a failed
+lookup leaves the row `failed` with the reason in `ingredient_error`, and the
+user never has to choose their food twice. `ingredient_status` is the contract:
+
+| status | meaning |
+| --- | --- |
+| `pending` | saved; lookup queued or running |
+| `ready` | `ingredients` populated |
+| `failed` | lookup failed or the model did not recognise the dish — call the refresh endpoint |
+
+The model's reply is parsed and validated against a Pydantic schema
+(`app/llm.py`) before it is stored, so malformed or hallucinated shapes become
+a `failed` row rather than junk in the database. `ingredients` is a JSONB
+column on Postgres, so it is directly queryable:
+
+```sql
+select name from favorite_food where ingredients @> '[{"name":"rice noodles"}]';
+```
+
+Check the endpoint from your own network:
+
+```bash
+python -m scripts.check_llm                      # the configured LLM_MODEL
+python -m scripts.check_llm openai/gpt-oss-20b   # a known-fast model
+```
 
 ## Demo data
 
@@ -107,6 +159,9 @@ table is dropped, so the initial migration's `downgrade()` drops `friendstatus`
 explicitly.
 
 ## Notes
+
+`LLM_MODEL` is whatever your endpoint serves. The code is provider-agnostic —
+any OpenAI-compatible `LLM_BASE_URL` works.
 
 There is no auth — `user_id` in the path is the acting user. Add a real auth
 dependency before exposing this beyond local use.

@@ -2,7 +2,8 @@ from datetime import date, datetime, timezone
 from enum import Enum
 from typing import Optional
 
-from sqlalchemy import DateTime
+from sqlalchemy import JSON, DateTime
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlmodel import Column, Field, Relationship, SQLModel, UniqueConstraint
 
 
@@ -13,6 +14,19 @@ def tz_column() -> Column:
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+# JSON on SQLite, JSONB on Postgres — same Python type, but JSONB is binary
+# and indexable, so ingredient lookups stay cheap as the table grows.
+JSON_TYPE = JSON().with_variant(JSONB(), "postgresql")
+
+
+class IngredientStatus(str, Enum):
+    """How the LLM enrichment for a favourite food went."""
+
+    pending = "pending"   # saved, ingredients not fetched yet
+    ready = "ready"       # ingredients stored
+    failed = "failed"     # the LLM call failed; retry via the refresh endpoint
 
 
 class FriendStatus(str, Enum):
@@ -31,6 +45,10 @@ class User(SQLModel, table=True):
 
     grocery_items: list["GroceryItem"] = Relationship(
         back_populates="owner",
+        sa_relationship_kwargs={"cascade": "all, delete-orphan"},
+    )
+    favorite_foods: list["FavoriteFood"] = Relationship(
+        back_populates="user",
         sa_relationship_kwargs={"cascade": "all, delete-orphan"},
     )
 
@@ -69,3 +87,35 @@ class Friend(SQLModel, table=True):
     friend_id: int = Field(foreign_key="app_user.id", index=True, ondelete="CASCADE")
     status: FriendStatus = Field(default=FriendStatus.pending, index=True)
     created_at: datetime = Field(default_factory=utcnow, sa_column=tz_column())
+
+
+class FavoriteFood(SQLModel, table=True):
+    """A food the user said they like during onboarding, plus its ingredients.
+
+    Ingredients come from an LLM and live in a JSON column on this same row, so
+    reading a user's tastes is one query with no join.
+    """
+
+    __tablename__ = "favorite_food"
+    __table_args__ = (
+        UniqueConstraint("user_id", "name", name="uq_favorite_food_per_user"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="app_user.id", index=True, ondelete="CASCADE")
+    name: str = Field(index=True, max_length=120)
+    cuisine: Optional[str] = Field(default=None, max_length=64)
+
+    # [{"name": "coconut milk", "category": "pantry", "essential": true}, ...]
+    ingredients: list[dict] = Field(default_factory=list, sa_column=Column(JSON_TYPE, nullable=False))
+
+    ingredient_status: IngredientStatus = Field(
+        default=IngredientStatus.pending, index=True
+    )
+    ingredient_error: Optional[str] = Field(default=None, max_length=255)
+    ingredients_updated_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True)
+    )
+    created_at: datetime = Field(default_factory=utcnow, sa_column=tz_column())
+
+    user: User = Relationship(back_populates="favorite_foods")

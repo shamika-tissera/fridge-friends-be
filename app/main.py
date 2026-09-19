@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
 
-from app.routers import friends, groceries, users
+from app.routers import friends, groceries, onboarding, users
 
 
 @asynccontextmanager
@@ -22,6 +22,7 @@ app = FastAPI(
 app.include_router(users.router)
 app.include_router(groceries.router)
 app.include_router(friends.router)
+app.include_router(onboarding.router)
 
 
 @app.get("/", include_in_schema=False)
