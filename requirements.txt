@@ -1,4 +1,4 @@
-fastapi>=0.115
+fastapi[standard]>=0.140
 uvicorn[standard]>=0.30
 sqlmodel>=0.0.22
 pydantic[email]>=2.8
