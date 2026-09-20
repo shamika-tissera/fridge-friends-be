@@ -22,3 +22,12 @@ dev = [
 
 [tool.fastapi]
 entrypoint = "app.main:app"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+# Flat layout with more than one top-level dir (app/, migrations/), so
+# setuptools' auto-discovery bails out. Ship only the application package.
+[tool.setuptools.packages.find]
+include = ["app*"]
