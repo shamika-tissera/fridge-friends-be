@@ -1,4 +1,4 @@
-"""Onboarding: the user picks foods they like, we store them with ingredients.
+"""Onboarding: the user picks foods they like and dislike, stored with ingredients.
 
 The ingredient lookup runs against a reasoning model that regularly takes over
 a minute, so it does **not** happen inside the request. The user's picks are
@@ -15,13 +15,13 @@ from sqlmodel import Session, col, select
 from app import database
 from app.database import get_session
 from app.llm import LLMUnavailable, extract_ingredients
-from app.models import FavoriteFood, IngredientStatus
+from app.models import FoodPreference, IngredientStatus, Preference
 from app.routers.users import get_user_or_404
-from app.schemas import FavoriteFoodCreate, FavoriteFoodRead, OnboardingResult
+from app.schemas import FoodPreferenceCreate, FoodPreferenceRead, OnboardingResult
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/users/{user_id}/favorite-foods", tags=["onboarding"])
+router = APIRouter(prefix="/users/{user_id}/food-preferences", tags=["onboarding"])
 
 
 def enrich_foods(food_ids: list[int]) -> None:
@@ -37,7 +37,7 @@ def enrich_foods(food_ids: list[int]) -> None:
     # Resolved at call time, not import time, so tests can swap the engine.
     with Session(database.engine) as session:
         rows = session.exec(
-            select(FavoriteFood).where(col(FavoriteFood.id).in_(food_ids))
+            select(FoodPreference).where(col(FoodPreference.id).in_(food_ids))
         ).all()
         if not rows:
             return
@@ -68,31 +68,43 @@ def enrich_foods(food_ids: list[int]) -> None:
                 row.ingredients_updated_at = now
             session.add(row)
         session.commit()
-        logger.info("enriched %d favorite foods", len(rows))
+        logger.info("enriched %d food preferences", len(rows))
 
 
 @router.post("", response_model=OnboardingResult, status_code=status.HTTP_202_ACCEPTED)
-def confirm_favorite_foods(
+def confirm_food_preferences(
     user_id: int,
-    payload: FavoriteFoodCreate,
+    payload: FoodPreferenceCreate,
     background: BackgroundTasks,
     session: Session = Depends(get_session),
 ):
-    """Confirm the onboarding screen: save the picks, look up ingredients after.
+    """Confirm the onboarding screen: save likes and dislikes, enrich after.
 
     Returns 202 — the foods are saved, and each comes back `pending` until the
-    background lookup fills in its ingredients.
+    background lookup fills in its ingredients. Ingredients are fetched for
+    dislikes too, so a recipe can be ruled out by what is *in* it.
     """
     get_user_or_404(user_id, session)
 
-    # Normalise whitespace and drop duplicates within the request itself.
-    wanted: list[str] = []
+    # Normalise whitespace, then de-duplicate across BOTH lists at once: a food
+    # named as both liked and disliked is contradictory, so the first mention
+    # wins rather than writing two rows that violate the unique constraint.
+    wanted: list[tuple[str, Preference]] = []
     seen: set[str] = set()
-    for raw in payload.foods:
+    conflicting: list[str] = []
+    for raw, kind in (
+        [(n, Preference.like) for n in payload.likes]
+        + [(n, Preference.dislike) for n in payload.dislikes]
+    ):
         name = " ".join(raw.split())
-        if name and name.lower() not in seen:
-            seen.add(name.lower())
-            wanted.append(name)
+        if not name:
+            continue
+        if name.lower() in seen:
+            if name.lower() in {n.lower() for n, _ in wanted}:
+                conflicting.append(name)
+            continue
+        seen.add(name.lower())
+        wanted.append((name, kind))
 
     if not wanted:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "No usable food names given")
@@ -100,12 +112,16 @@ def confirm_favorite_foods(
     already = {
         row.name.lower()
         for row in session.exec(
-            select(FavoriteFood).where(col(FavoriteFood.user_id) == user_id)
+            select(FoodPreference).where(col(FoodPreference.user_id) == user_id)
         ).all()
     }
 
-    new_rows = [FavoriteFood(user_id=user_id, name=n) for n in wanted if n.lower() not in already]
-    skipped = [n for n in wanted if n.lower() in already]
+    new_rows = [
+        FoodPreference(user_id=user_id, name=n, preference=k)
+        for n, k in wanted
+        if n.lower() not in already
+    ]
+    skipped = [n for n, _ in wanted if n.lower() in already] + conflicting
 
     for row in new_rows:
         session.add(row)
@@ -116,33 +132,39 @@ def confirm_favorite_foods(
     background.add_task(enrich_foods, [row.id for row in new_rows])
 
     return OnboardingResult(
-        saved=[FavoriteFoodRead.model_validate(r) for r in new_rows],
+        saved=[FoodPreferenceRead.model_validate(r) for r in new_rows],
         skipped=skipped,
         ingredients_pending=len(new_rows),
     )
 
 
-@router.get("", response_model=list[FavoriteFoodRead])
-def list_favorite_foods(user_id: int, session: Session = Depends(get_session)):
-    """The user's foods and their ingredients. Poll this after onboarding."""
+@router.get("", response_model=list[FoodPreferenceRead])
+def list_food_preferences(
+    user_id: int,
+    preference: Preference | None = None,
+    session: Session = Depends(get_session),
+):
+    """The user's foods and their ingredients. Poll this after onboarding.
+
+    Filter with `?preference=like` or `?preference=dislike`.
+    """
     get_user_or_404(user_id, session)
-    return session.exec(
-        select(FavoriteFood)
-        .where(col(FavoriteFood.user_id) == user_id)
-        .order_by(col(FavoriteFood.id).asc())
-    ).all()
+    statement = select(FoodPreference).where(col(FoodPreference.user_id) == user_id)
+    if preference is not None:
+        statement = statement.where(col(FoodPreference.preference) == preference)
+    return session.exec(statement.order_by(col(FoodPreference.id).asc())).all()
 
 
-def get_food_or_404(user_id: int, food_id: int, session: Session) -> FavoriteFood:
-    food = session.get(FavoriteFood, food_id)
+def get_pref_or_404(user_id: int, food_id: int, session: Session) -> FoodPreference:
+    food = session.get(FoodPreference, food_id)
     if food is None or food.user_id != user_id:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Favorite food {food_id} not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Food preference {food_id} not found")
     return food
 
 
 @router.post(
     "/{food_id}/refresh-ingredients",
-    response_model=FavoriteFoodRead,
+    response_model=FoodPreferenceRead,
     status_code=status.HTTP_202_ACCEPTED,
 )
 def refresh_ingredients(
@@ -152,7 +174,7 @@ def refresh_ingredients(
     session: Session = Depends(get_session),
 ):
     """Re-ask the model for one food's ingredients — the retry for a `failed` row."""
-    food = get_food_or_404(user_id, food_id, session)
+    food = get_pref_or_404(user_id, food_id, session)
     food.ingredient_status = IngredientStatus.pending
     food.ingredient_error = None
     session.add(food)
@@ -164,8 +186,8 @@ def refresh_ingredients(
 
 
 @router.delete("/{food_id}", status_code=status.HTTP_204_NO_CONTENT)
-def remove_favorite_food(
+def remove_food_preference(
     user_id: int, food_id: int, session: Session = Depends(get_session)
 ):
-    session.delete(get_food_or_404(user_id, food_id, session))
+    session.delete(get_pref_or_404(user_id, food_id, session))
     session.commit()

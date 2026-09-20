@@ -1,11 +1,27 @@
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import event
 from sqlmodel import Session, SQLModel, create_engine
 from sqlmodel.pool import StaticPool
 
-from app import database
+from app import database, llm
 from app.database import get_session
 from app.main import app
+
+
+@pytest.fixture(autouse=True)
+def no_real_llm_calls(monkeypatch):
+    """Fail fast if a test reaches the real LLM.
+
+    Without this, an unstubbed test makes a live network call: slow, billed,
+    and it hangs the whole suite rather than failing.
+    """
+    def _blocked(*args, **kwargs):
+        raise AssertionError(
+            "This test tried to call the real LLM. Stub app.llm.call_model instead."
+        )
+
+    monkeypatch.setattr(llm, "get_client", _blocked)
 
 
 @pytest.fixture(name="session")
@@ -13,6 +29,16 @@ def session_fixture(monkeypatch):
     engine = create_engine(
         "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
     )
+
+    # SQLite ignores foreign keys unless asked, so without this the test DB
+    # silently skips ON DELETE CASCADE that Postgres would apply — the tests
+    # would pass while production behaved differently.
+    @event.listens_for(engine, "connect")
+    def _enable_fks(dbapi_connection, _record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
     # Point the app's lifespan at this in-memory engine so running the tests
     # never touches (or creates) the real sqlite file.
     monkeypatch.setattr(database, "engine", engine)

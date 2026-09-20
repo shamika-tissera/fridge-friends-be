@@ -3,8 +3,10 @@
 Expiry dates are relative to the day you run this, so the /expiring endpoints
 always have something interesting to return.
 
-    python -m scripts.seed           # add demo data (skips if already seeded)
-    python -m scripts.seed --reset   # delete demo users first, then re-seed
+    python -m scripts.seed               # add demo data (skips if already seeded)
+    python -m scripts.seed --reset       # delete demo users first, then re-seed
+    python -m scripts.seed --with-foods  # also run onboarding (makes real LLM calls)
+    python -m scripts.seed --with-feasts # also plan feasts (implies --with-foods)
 """
 
 import argparse
@@ -14,7 +16,18 @@ from datetime import date, timedelta
 from sqlmodel import Session, col, select
 
 from app.database import DATABASE_URL, engine
-from app.models import Friend, FriendStatus, GroceryItem, User
+from app.services import normalise
+from app.models import (
+    Feast,
+    FeastAttendee,
+    FoodPreference,
+    Friend,
+    FriendStatus,
+    GroceryItem,
+    Notification,
+    Preference,
+    User,
+)
 
 # Everything seeded lives on this domain, so --reset can find it precisely
 # instead of truncating tables that may hold real rows.
@@ -36,6 +49,25 @@ FRIENDSHIPS = [
     ("theo", "mei", FriendStatus.pending),   # not yet accepted
     ("sam", "obi", FriendStatus.pending),    # not yet accepted
     ("mei", "obi", FriendStatus.blocked),
+]
+
+# Onboarding picks per user. Only used with --with-foods, because filling in
+# their ingredients means real (billed) LLM calls.
+FOOD_PREFERENCES = {
+    # handle: (likes, dislikes)
+    "sam": (["Pad Thai", "Chicken Curry"], ["Liver and Onions"]),
+    "nadia": (["Masala Dosa", "Shakshuka"], ["Oysters"]),
+    "theo": (["Carbonara"], ["Durian"]),
+    "mei": (["Tonkotsu Ramen"], []),
+    "obi": (["Jollof Rice"], ["Marmite on Toast"]),
+}
+
+# Feasts to plan, as (name, host, guests, days_from_now, hour). The recipe for
+# each is chosen by actually running the suggestion endpoint's logic, so the
+# stored snapshot is a real suggestion rather than a hand-written fake.
+FEASTS = [
+    ("Friday Night Cook-Up", "sam", ["theo", "mei"], 2, 19),
+    ("Sunday Brunch", "nadia", ["sam", "obi"], 4, 11),
 ]
 
 # (owner, name, qty, unit, category, days_until_expiry, days_since_purchase, consumed)
@@ -94,7 +126,7 @@ def reset(session: Session) -> int:
     return len(doomed)
 
 
-def seed(session: Session) -> None:
+def seed(session: Session) -> dict[str, User]:
     today = date.today()
 
     users: dict[str, User] = {}
@@ -128,6 +160,121 @@ def seed(session: Session) -> None:
         )
 
     session.commit()
+    return users
+
+
+def seed_food_preferences(session: Session, users: dict[str, User]) -> None:
+    """Run the onboarding path for each demo user. Makes real LLM calls."""
+    from app.routers.onboarding import enrich_foods
+
+    created: list[int] = []
+    for handle, (likes, dislikes) in FOOD_PREFERENCES.items():
+        user = users.get(handle)
+        if user is None:
+            continue
+        for name, kind in (
+            [(n, Preference.like) for n in likes]
+            + [(n, Preference.dislike) for n in dislikes]
+        ):
+            row = FoodPreference(user_id=user.id, name=name, preference=kind)
+            session.add(row)
+            session.flush()
+            created.append(row.id)
+    session.commit()
+
+    print(f"looking up ingredients for {len(created)} foods (this calls the LLM)...")
+    enrich_foods(created)
+
+
+def seed_feasts(session: Session, users: dict[str, User]) -> None:
+    """Plan each demo feast around a genuine recipe suggestion.
+
+    Uses the same services the API uses, so the seeded rows are exactly the
+    shape the endpoints produce.
+    """
+    from datetime import datetime, time, timedelta, timezone
+
+    from app.llm import LLMUnavailable, suggest_recipes
+    from app.models import InviteResponse
+    from app.notifications import notify_feast_invitations
+    from app.services import create_feast, pantry_for, preferences_for
+
+    for name, host_handle, guest_handles, days_out, hour in FEASTS:
+        host = users.get(host_handle)
+        guests = [users[g] for g in guest_handles if g in users]
+        if host is None:
+            continue
+
+        group = [host.id] + [g.id for g in guests]
+        pantry = pantry_for(session, group)
+        liked, disliked = preferences_for(session, group)
+
+        print(f"  {name}: asking for a recipe from {len(pantry)} ingredients...")
+        try:
+            recipes = suggest_recipes(
+                available=[e.name for e in pantry.values()],
+                expiring=[e.name for e in pantry.values() if e.expiring],
+                liked=liked, disliked=disliked, limit=3,
+            )
+        except LLMUnavailable as exc:
+            print(f"  {name}: skipped — {exc}")
+            continue
+
+        disliked_keys = {normalise(d) for d in disliked}
+        chosen = next((r for r in recipes if normalise(r.name) not in disliked_keys), None)
+        if chosen is None:
+            print(f"  {name}: skipped — no usable suggestion")
+            continue
+
+        # Shape the snapshot the way the API stores it: resolved against the
+        # real pantry, so it records who brings what.
+        uses = []
+        for key in dict.fromkeys(normalise(u) for u in chosen.uses):
+            entry = pantry.get(key)
+            if entry is not None:
+                uses.append({"name": entry.name, "from_users": list(entry.owners),
+                             "expiring": entry.expiring})
+        total = (chosen.prep_minutes + chosen.cook_minutes
+                 if chosen.prep_minutes is not None and chosen.cook_minutes is not None
+                 else None)
+        snapshot = {
+            "rank": 1,
+            "rank_reason": "Seeded demo choice",
+            "name": chosen.name,
+            "cuisine": chosen.cuisine or None,
+            "uses": uses,
+            "missing": chosen.missing,
+            "uses_expiring": [u["name"] for u in uses if u["expiring"]],
+            "prep_minutes": chosen.prep_minutes,
+            "cook_minutes": chosen.cook_minutes,
+            "total_minutes": total,
+            "contributors": list(dict.fromkeys(o for u in uses for o in u["from_users"])),
+            "liked_by": [], "is_liked": normalise(chosen.name) in {normalise(l) for l in liked},
+            "why": chosen.why or None,
+        }
+
+        when = datetime.combine(
+            date.today() + timedelta(days=days_out), time(hour, 0), tzinfo=timezone.utc
+        )
+        feast = create_feast(
+            session, name=name, host=host,
+            attendee_ids=[g.id for g in guests], recipe=snapshot, scheduled_for=when,
+        )
+        sent = notify_feast_invitations(session, feast.id)
+        print(f"  {name}: '{chosen.name}', {len(guests)} invited, {sent} delivered")
+
+        # Give the demo some variety: first guest accepts, second declines.
+        rows = session.exec(
+            select(FeastAttendee)
+            .where(col(FeastAttendee.feast_id) == feast.id)
+            .where(col(FeastAttendee.user_id) != host.id)
+            .order_by(col(FeastAttendee.id).asc())
+        ).all()
+        for row, response in zip(rows, [InviteResponse.accepted, InviteResponse.declined]):
+            row.response = response
+            row.responded_at = datetime.now(timezone.utc)
+            session.add(row)
+        session.commit()
 
 
 def main() -> int:
@@ -136,6 +283,16 @@ def main() -> int:
         "--reset",
         action="store_true",
         help="delete existing demo users (and their data) before seeding",
+    )
+    parser.add_argument(
+        "--with-foods",
+        action="store_true",
+        help="also seed food preferences, looking up ingredients via the LLM",
+    )
+    parser.add_argument(
+        "--with-feasts",
+        action="store_true",
+        help="also plan feasts and send invitations (implies --with-foods)",
     )
     args = parser.parse_args()
 
@@ -149,18 +306,41 @@ def main() -> int:
         ).all()
 
         if existing and not args.reset:
+            # Feasts can be added to an already-seeded database — they depend
+            # on the users and pantries, not on a fresh seed.
+            if args.with_feasts:
+                by_handle = {u.email.split("@")[0]: u for u in existing}
+                seed_feasts(session, by_handle)
+                feasts = session.exec(select(Feast)).all()
+                notes = session.exec(select(Notification)).all()
+                print(f"{len(feasts)} feasts, {len(notes)} notifications")
+                return 0
             print(f"already seeded ({len(existing)} demo users) — pass --reset to redo")
             return 0
 
         if args.reset and existing:
             print(f"removed {reset(session)} demo users")
 
-        seed(session)
+        users_by_handle = seed(session)
+        # A feast needs preferences to rank against, so it pulls foods in too.
+        if args.with_foods or args.with_feasts:
+            seed_food_preferences(session, users_by_handle)
+        if args.with_feasts:
+            seed_feasts(session, users_by_handle)
 
         users = session.exec(select(User)).all()
         items = session.exec(select(GroceryItem)).all()
         friends = session.exec(select(Friend)).all()
-        print(f"seeded {len(users)} users, {len(items)} items, {len(friends)} friendships")
+        foods = session.exec(select(FoodPreference)).all()
+        feasts = session.exec(select(Feast)).all()
+        notes = session.exec(select(Notification)).all()
+        print(
+            f"seeded {len(users)} users, {len(items)} items, "
+            f"{len(friends)} friendships, {len(foods)} food preferences, "
+            f"{len(feasts)} feasts, {len(notes)} notifications"
+        )
+        if not (args.with_foods or args.with_feasts):
+            print("(pass --with-foods for preferences, --with-feasts for feasts)")
 
     return 0
 

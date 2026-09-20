@@ -21,6 +21,13 @@ def utcnow() -> datetime:
 JSON_TYPE = JSON().with_variant(JSONB(), "postgresql")
 
 
+class Preference(str, Enum):
+    """Whether the user likes or dislikes a food."""
+
+    like = "like"
+    dislike = "dislike"
+
+
 class IngredientStatus(str, Enum):
     """How the LLM enrichment for a favourite food went."""
 
@@ -47,7 +54,7 @@ class User(SQLModel, table=True):
         back_populates="owner",
         sa_relationship_kwargs={"cascade": "all, delete-orphan"},
     )
-    favorite_foods: list["FavoriteFood"] = Relationship(
+    food_preferences: list["FoodPreference"] = Relationship(
         back_populates="user",
         sa_relationship_kwargs={"cascade": "all, delete-orphan"},
     )
@@ -89,21 +96,25 @@ class Friend(SQLModel, table=True):
     created_at: datetime = Field(default_factory=utcnow, sa_column=tz_column())
 
 
-class FavoriteFood(SQLModel, table=True):
-    """A food the user said they like during onboarding, plus its ingredients.
+class FoodPreference(SQLModel, table=True):
+    """A food the user likes or dislikes, plus its ingredients.
 
-    Ingredients come from an LLM and live in a JSON column on this same row, so
-    reading a user's tastes is one query with no join.
+    Likes and dislikes share one table because they carry identical data and are
+    almost always read together ("suggest things they like, avoiding anything
+    with an ingredient they dislike"). The unique constraint is on
+    (user_id, name) without the preference, so a user cannot both like and
+    dislike the same food.
     """
 
-    __tablename__ = "favorite_food"
+    __tablename__ = "food_preference"
     __table_args__ = (
-        UniqueConstraint("user_id", "name", name="uq_favorite_food_per_user"),
+        UniqueConstraint("user_id", "name", name="uq_food_preference_per_user"),
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
     user_id: int = Field(foreign_key="app_user.id", index=True, ondelete="CASCADE")
     name: str = Field(index=True, max_length=120)
+    preference: Preference = Field(default=Preference.like, index=True)
     cuisine: Optional[str] = Field(default=None, max_length=64)
 
     # [{"name": "coconut milk", "category": "pantry", "essential": true}, ...]
@@ -118,4 +129,87 @@ class FavoriteFood(SQLModel, table=True):
     )
     created_at: datetime = Field(default_factory=utcnow, sa_column=tz_column())
 
-    user: User = Relationship(back_populates="favorite_foods")
+    user: User = Relationship(back_populates="food_preferences")
+
+
+class InviteResponse(str, Enum):
+    """Where an attendee stands on their invitation."""
+
+    invited = "invited"
+    accepted = "accepted"
+    declined = "declined"
+
+
+class DeliveryStatus(str, Enum):
+    pending = "pending"
+    sent = "sent"
+    failed = "failed"
+
+
+class Feast(SQLModel, table=True):
+    """A planned meal built around one chosen recipe."""
+
+    __tablename__ = "feast"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str = Field(max_length=120)
+    host_id: int = Field(foreign_key="app_user.id", index=True, ondelete="CASCADE")
+    scheduled_for: Optional[datetime] = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True, index=True)
+    )
+
+    # A full snapshot of the chosen suggestion. Recipes are generated on the fly
+    # and stored nowhere else, so a reference would dangle the moment the
+    # suggestion call returns. Snapshotting also keeps the feast honest: it
+    # records what was agreed to, even after pantries and preferences change.
+    recipe: dict = Field(default_factory=dict, sa_column=Column(JSON_TYPE, nullable=False))
+
+    created_at: datetime = Field(default_factory=utcnow, sa_column=tz_column())
+
+    host: User = Relationship()
+    attendees: list["FeastAttendee"] = Relationship(
+        back_populates="feast",
+        sa_relationship_kwargs={"cascade": "all, delete-orphan"},
+    )
+
+
+class FeastAttendee(SQLModel, table=True):
+    """Association entity: one person invited to one feast."""
+
+    __tablename__ = "feast_attendee"
+    __table_args__ = (
+        UniqueConstraint("feast_id", "user_id", name="uq_feast_attendee"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    feast_id: int = Field(foreign_key="feast.id", index=True, ondelete="CASCADE")
+    user_id: int = Field(foreign_key="app_user.id", index=True, ondelete="CASCADE")
+    response: InviteResponse = Field(default=InviteResponse.invited, index=True)
+    responded_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True)
+    )
+    created_at: datetime = Field(default_factory=utcnow, sa_column=tz_column())
+
+    feast: Feast = Relationship(back_populates="attendees")
+    user: User = Relationship()
+
+
+class Notification(SQLModel, table=True):
+    """An in-app message for one user. Also the delivery record for a channel."""
+
+    __tablename__ = "notification"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="app_user.id", index=True, ondelete="CASCADE")
+    kind: str = Field(default="feast_invitation", index=True, max_length=48)
+    title: str = Field(max_length=160)
+    body: str = Field(max_length=1000)
+    feast_id: Optional[int] = Field(
+        default=None, foreign_key="feast.id", index=True, ondelete="CASCADE"
+    )
+    delivery_status: DeliveryStatus = Field(default=DeliveryStatus.pending, index=True)
+    delivery_error: Optional[str] = Field(default=None, max_length=255)
+    read_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True)
+    )
+    created_at: datetime = Field(default_factory=utcnow, sa_column=tz_column())
