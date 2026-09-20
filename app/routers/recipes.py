@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlmodel import Session
 
 from app.database import get_session
+from app.dietary import cuisines_for, rules_for
 from app.llm import LLMUnavailable, suggest_recipes
 from app.routers.users import get_user_or_404
 from app.schemas import RecipeIngredient, RecipeRead, RecipeRequest, RecipeResponse
@@ -33,6 +34,8 @@ def suggest(payload: RecipeRequest, session: Session = Depends(get_session)):
     available = [entry.name for entry in pantry.values()]
     expiring = [entry.name for entry in pantry.values() if entry.expiring]
     liked, disliked = preferences_for(session, user_ids)
+    rules = rules_for(session, user_ids)
+    cuisines = cuisines_for(session, user_ids)
 
     if not available:
         return RecipeResponse(
@@ -51,6 +54,8 @@ def suggest(payload: RecipeRequest, session: Session = Depends(get_session)):
             liked=liked,
             disliked=disliked,
             limit=payload.max_results,
+            hard_rules=rules.prompt_lines(),
+            cuisines=cuisines,
         )
     except LLMUnavailable as exc:
         logger.warning("recipe suggestion failed: %s", exc)
@@ -73,10 +78,23 @@ def suggest(payload: RecipeRequest, session: Session = Depends(get_session)):
     kept: list[RecipeRead] = []
     used_recipes = []   # the model's version of each kept recipe, index-aligned
     seen: set[str] = set()
+    rejected_for_rules = 0
     for recipe in raw_recipes:
         key = normalise(recipe.name)
         if key in disliked_keys or key in seen:
             continue
+
+        # Allergens and diets are checked against the dish name and everything
+        # it calls for, including what is still to buy. A suggestion that trips
+        # one is dropped outright rather than shown with a warning — the
+        # onboarding screen promised these would never appear.
+        violations = rules.violations([recipe.name, *recipe.uses, *recipe.missing])
+        if violations:
+            logger.info("dropped %r: breaks dietary rules (%s)",
+                        recipe.name, ", ".join(violations))
+            rejected_for_rules += 1
+            continue
+
         seen.add(key)
         used_recipes.append(recipe)
         total = (
@@ -158,7 +176,12 @@ def suggest(payload: RecipeRequest, session: Session = Depends(get_session)):
 
     liked_matches = sum(1 for r in kept if r.is_liked)
     detail = None
-    if not kept:
+    if not kept and rejected_for_rules:
+        detail = (
+            "Every suggestion clashed with the group's allergies or diets — "
+            "nothing safe could be made from these ingredients"
+        )
+    elif not kept:
         detail = "No suitable recipes could be suggested from these ingredients"
     elif liked_matches == 0:
         detail = (
@@ -172,5 +195,7 @@ def suggest(payload: RecipeRequest, session: Session = Depends(get_session)):
         available_ingredients=len(available),
         expiring_ingredients=expiring,
         liked_matches=liked_matches,
+        dietary_rules_applied=[line.split(":")[0] for line in rules.prompt_lines()],
+        excluded_for_dietary_rules=rejected_for_rules,
         detail=detail,
     )

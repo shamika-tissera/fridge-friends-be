@@ -30,7 +30,8 @@ class LogChannel:
     name = "log"
 
     def send(self, *, to: User, title: str, body: str) -> None:
-        logger.info("NOTIFY %s <%s>: %s | %s", to.name, to.email, title, body)
+        # Identify by User ID: an account created on the join screen has no email.
+        logger.info("NOTIFY %s (@%s): %s | %s", to.name, to.username, title, body)
 
 
 class NullChannel:

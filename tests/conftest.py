@@ -57,8 +57,19 @@ def client_fixture(session):
 
 @pytest.fixture
 def make_user(client):
-    def _make(email: str, name: str = "Test User") -> int:
-        resp = client.post("/users", json={"email": email, "name": name})
+    def _make(email: str, name: str = "Test User", **extra) -> int:
+        # Tests identify users by email; the User ID is derived from it so a
+        # test only has to care about the handle when it is testing sign-up.
+        body = {
+            # Padded: some fixtures use two-character local parts, and the
+            # User ID has a three-character minimum.
+            "username": extra.pop("username", None) or f"u-{email.split('@')[0].lower()}",
+            "password": extra.pop("password", "shelf-life-8"),
+            "email": email,
+            "name": name,
+            **extra,
+        }
+        resp = client.post("/users", json=body)
         assert resp.status_code == 201, resp.text
         return resp.json()["id"]
 

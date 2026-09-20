@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
 
-from app.routers import feasts, friends, groceries, onboarding, recipes, users
+from app.routers import auth, feasts, friends, groceries, onboarding, recipes, users
 
 
 @asynccontextmanager
@@ -19,6 +19,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.include_router(auth.router)
 app.include_router(users.router)
 app.include_router(groceries.router)
 app.include_router(friends.router)

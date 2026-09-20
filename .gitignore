@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local fallback database (DATABASE_URL unset)
+grocery.db
+*.db-journal

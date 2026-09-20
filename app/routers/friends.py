@@ -3,8 +3,16 @@ from sqlmodel import Session, col, or_, select
 
 from app.database import get_session
 from app.models import Friend, FriendStatus, User
-from app.routers.users import get_user_or_404
-from app.schemas import FriendCreate, FriendRead, FriendUpdate, FriendWithUser
+from app.routers.users import get_by_username, get_user_or_404
+from app.schemas import (
+    FriendCreate,
+    FriendInvite,
+    FriendRead,
+    FriendShelfRead,
+    FriendUpdate,
+    FriendWithUser,
+)
+from app.services import friend_shelf, rescue_counts
 
 router = APIRouter(prefix="/users/{user_id}/friends", tags=["friends"])
 
@@ -40,6 +48,20 @@ def add_friend(
     return friendship
 
 
+@router.post("/invite", response_model=FriendRead, status_code=status.HTTP_201_CREATED)
+def invite_by_username(
+    user_id: int, payload: FriendInvite, session: Session = Depends(get_session)
+):
+    """Invite by User ID — the invite box collects a handle, not an internal id."""
+    get_user_or_404(user_id, session)
+    other = get_by_username(session, payload.username)
+    if other is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, f"No one is using the User ID {payload.username!r}"
+        )
+    return add_friend(user_id, FriendCreate(friend_id=other.id), session)
+
+
 @router.get("", response_model=list[FriendWithUser])
 def list_friends(
     user_id: int,
@@ -53,12 +75,43 @@ def list_friends(
     if status_filter is not None:
         statement = statement.where(col(Friend.status) == status_filter)
 
+    rows = session.exec(statement).all()
+    others = {
+        row.id: (row.friend_id if row.user_id == user_id else row.user_id) for row in rows
+    }
+    # One query for every row's "2 buddies need rescuing", rather than one each.
+    counts = rescue_counts(session, list(dict.fromkeys(others.values())))
+
     out = []
-    for row in session.exec(statement).all():
-        other_id = row.friend_id if row.user_id == user_id else row.user_id
-        other = session.get(User, other_id)
-        out.append(FriendWithUser(**row.model_dump(), friend=other))
+    for row in rows:
+        other_id = others[row.id]
+        out.append(
+            FriendWithUser(
+                **row.model_dump(),
+                friend=session.get(User, other_id),
+                needs_rescue=counts.get(other_id, 0),
+            )
+        )
     return out
+
+
+@router.get("/{friend_id}/shelf", response_model=FriendShelfRead)
+def get_friend_shelf(
+    user_id: int, friend_id: int, session: Session = Depends(get_session)
+):
+    """A friend's yellow and red buddies, so you can offer to cook with them.
+
+    Accepted friends only, and **no prices** — the response shape has no field
+    for one. A pending or blocked friendship is a 403, not a peek.
+    """
+    get_user_or_404(user_id, session)
+    get_user_or_404(friend_id, session)
+    friendship = find_friendship(session, user_id, friend_id)
+    if friendship is None or friendship.status != FriendStatus.accepted:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "You can only see an accepted friend's shelf"
+        )
+    return friend_shelf(session, friend_id)
 
 
 @router.patch("/{friend_id}", response_model=FriendRead)

@@ -21,6 +21,65 @@ def utcnow() -> datetime:
 JSON_TYPE = JSON().with_variant(JSONB(), "postgresql")
 
 
+class Buddy(str, Enum):
+    """The character the user picks at sign-up, and the sprite drawn beside them."""
+
+    sammy = "sammy"     # leaf
+    milo = "milo"       # milk carton
+    eddie = "eddie"     # egg
+    carl = "carl"       # canned tomatoes
+    bella = "bella"     # potato
+
+
+class Diet(str, Enum):
+    """A way of eating the user follows. A user may follow several."""
+
+    vegetarian = "vegetarian"
+    vegan = "vegan"
+    pescatarian = "pescatarian"
+    gluten_free = "gluten_free"
+    dairy_free = "dairy_free"
+
+
+class Allergen(str, Enum):
+    """Something the user always avoids. Enforced, not merely preferred."""
+
+    peanuts = "peanuts"
+    shellfish = "shellfish"
+    tree_nuts = "tree_nuts"
+    sesame = "sesame"
+
+
+class SpoilageProfile(str, Enum):
+    """How an ingredient goes off, which is what the shelf animation reflects."""
+
+    gradual = "gradual"   # wilts over days: leaves, most produce
+    sudden = "sudden"     # fine until it is not: dairy, fish, meat
+    stable = "stable"     # cupboard goods measured in months or years
+
+
+class ItemOutcome(str, Enum):
+    """How an item's life ended. The whole waste-and-spending screen rests on this.
+
+    `consumed` only ever said "gone"; it could not tell eating something from
+    throwing it away, which is exactly the difference the screen reports.
+    """
+
+    on_shelf = "on_shelf"
+    used = "used"       # eaten or cooked with
+    wasted = "wasted"   # thrown out
+
+
+class Freshness(str, Enum):
+    """The chip shown on the shelf. Derived from `expires_on`, never stored."""
+
+    fresh = "fresh"
+    use_soon = "use_soon"
+    use_now = "use_now"
+    expired = "expired"
+    unknown = "unknown"   # no expiry date recorded
+
+
 class Preference(str, Enum):
     """Whether the user likes or dislikes a food."""
 
@@ -46,8 +105,32 @@ class User(SQLModel, table=True):
     __tablename__ = "app_user"
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    email: str = Field(index=True, unique=True, max_length=255)
+
+    # The "User ID" on the sign-up screen (e.g. "pantry.pal"): what someone
+    # types to log in, and how friends find each other. Stored lowercase.
+    username: str = Field(index=True, unique=True, max_length=40)
+
+    # Optional: the sign-up screen never asks for it. Notifications fall back
+    # to the in-app inbox, which is the durable record anyway.
+    email: Optional[str] = Field(default=None, index=True, unique=True, max_length=255)
     name: str = Field(max_length=120)
+
+    # Null for accounts created before passwords existed, and for seed data.
+    # verify_password() treats that as "can never log in" rather than "no check".
+    password_hash: Optional[str] = Field(default=None, max_length=255)
+    buddy: Buddy = Field(default=Buddy.sammy)
+
+    # The onboarding screen's three multi-selects. They are short, fixed lists
+    # always read together with the user, so they live here as JSON rather than
+    # in three join tables that would never be queried independently.
+    diets: list[str] = Field(default_factory=list, sa_column=Column(JSON_TYPE, nullable=False))
+    avoid_allergens: list[str] = Field(
+        default_factory=list, sa_column=Column(JSON_TYPE, nullable=False)
+    )
+    favorite_cuisines: list[str] = Field(
+        default_factory=list, sa_column=Column(JSON_TYPE, nullable=False)
+    )
+
     created_at: datetime = Field(default_factory=utcnow, sa_column=tz_column())
 
     grocery_items: list["GroceryItem"] = Relationship(
@@ -72,7 +155,30 @@ class GroceryItem(SQLModel, table=True):
     category: Optional[str] = Field(default=None, index=True, max_length=64)
     expires_on: Optional[date] = Field(default=None, index=True)
     purchased_on: Optional[date] = Field(default=None)
+    # Kept as the "no longer on the shelf" flag it always was, and moved in
+    # step with `outcome` so existing callers keep working.
     consumed: bool = Field(default=False, index=True)
+
+    outcome: ItemOutcome = Field(default=ItemOutcome.on_shelf, index=True)
+    resolved_on: Optional[date] = Field(default=None, index=True)
+
+    # Set when an item is used while it is already in the "use now" or expired
+    # band — food that would have been binned tomorrow. Recorded at that moment
+    # rather than derived later, because the band it was in is not recoverable
+    # once the item is gone.
+    rescued: bool = Field(default=False, index=True)
+
+    # What it cost, for the "you rescued $X of food" story. Float, like
+    # quantity: these are display totals, never billed against.
+    price: Optional[float] = Field(default=None, ge=0)
+
+    # Filled from the freshness catalogue when the item is added, then kept:
+    # re-deriving later would silently move an item's expiry if the catalogue
+    # changed. `expires_on` = purchased_on + shelf_life_days unless the user
+    # overrode the date.
+    shelf_life_days: Optional[int] = Field(default=None, ge=0)
+    spoilage_profile: SpoilageProfile = Field(default=SpoilageProfile.gradual, index=True)
+    shelf_buddy: str = Field(default="leaf", max_length=32)
     created_at: datetime = Field(default_factory=utcnow, sa_column=tz_column())
 
     owner_id: int = Field(foreign_key="app_user.id", index=True, ondelete="CASCADE")

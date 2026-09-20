@@ -220,12 +220,15 @@ def suggest_recipes(
     liked: list[str],
     disliked: list[str],
     limit: int,
+    hard_rules: list[str] | None = None,
+    cuisines: list[str] | None = None,
 ) -> list[Recipe]:
     """Ask the model for recipes cookable from `available`.
 
-    The like/dislike rules are *also* enforced by the caller — a prompt is not
-    a guarantee, and "never suggest something they dislike" has to hold even
-    when the model ignores the instruction.
+    `hard_rules` carries the group's allergies and diets; `cuisines` their
+    favourites. Both are *also* enforced or applied by the caller — a prompt is
+    not a guarantee, and "no peanuts, ever" has to hold even when the model
+    ignores the instruction.
     """
     if not available:
         return []
@@ -235,12 +238,24 @@ def suggest_recipes(
 
     marked = [f"{name} [EXPIRING]" if name in set(expiring) else name for name in available]
 
-    prompt = (
-        f"Suggest up to {limit} recipes.\n\n"
-        f"AVAILABLE ingredients:\n{bullets(marked)}\n\n"
-        f"LIKED dishes (prefer these if they can be made):\n{bullets(liked)}\n\n"
-        f"DISLIKED dishes (never suggest these):\n{bullets(disliked)}"
-    )
+    sections = [
+        f"Suggest up to {limit} recipes.",
+        f"AVAILABLE ingredients:\n{bullets(marked)}",
+        f"LIKED dishes (prefer these if they can be made):\n{bullets(liked)}",
+        f"DISLIKED dishes (never suggest these):\n{bullets(disliked)}",
+    ]
+    if cuisines:
+        sections.append(
+            "FAVOURITE cuisines (lean this way when the ingredients allow):\n"
+            + bullets(cuisines)
+        )
+    if hard_rules:
+        # Last, and phrased as absolutes: these are the rules a suggestion is
+        # rejected for breaking, not preferences to balance.
+        sections.append("HARD RULES — a recipe breaking any of these is unusable:\n"
+                        + "\n".join(f"- {rule}" for rule in hard_rules))
+
+    prompt = "\n\n".join(sections)
 
     raw = call_model(prompt, system=RECIPE_SYSTEM_PROMPT)
 

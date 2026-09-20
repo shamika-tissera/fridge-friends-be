@@ -8,9 +8,9 @@ def iso(days: int) -> str:
 
 
 def add_item(client, user_id, name, days=None, **extra):
-    body = {"name": name, **extra}
-    if days is not None:
-        body["expires_on"] = iso(days)
+    # days=None means "no expiry at all": sending an explicit null opts out of
+    # the shelf-life the server would otherwise derive from the name.
+    body = {"name": name, "expires_on": iso(days) if days is not None else None, **extra}
     resp = client.post(f"/users/{user_id}/grocery-items", json=body)
     assert resp.status_code == 201, resp.text
     return resp.json()
@@ -22,7 +22,21 @@ def test_health(client):
 
 def test_duplicate_email_conflicts(client, make_user):
     make_user("a@example.com")
-    assert client.post("/users", json={"email": "a@example.com", "name": "X"}).status_code == 409
+    duplicate = {
+        "username": "someone.else",
+        "password": "shelf-life-8",
+        "email": "a@example.com",
+        "name": "X",
+    }
+    assert client.post("/users", json=duplicate).status_code == 409
+
+
+def test_duplicate_username_conflicts(client, make_user):
+    make_user("first@example.com", username="pantry.pal")
+    clash = {"username": "Pantry.Pal", "password": "shelf-life-8", "name": "Other"}
+    resp = client.post("/users", json=clash)
+    assert resp.status_code == 409, resp.text
+    assert "User ID" in resp.json()["detail"]
 
 
 def test_item_crud(client, make_user):

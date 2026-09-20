@@ -29,8 +29,8 @@ pytest     # always runs on in-memory sqlite, never touches your real DB
 
 | Entity | Notes |
 | --- | --- |
-| `User` | `id`, unique `email`, `name`, `created_at` — table is `app_user`, since `user` is reserved in Postgres |
-| `GroceryItem` | belongs to one user; `expires_on`, `consumed`, `quantity`/`unit`, `category` |
+| `User` | `id`, unique `username` (the "User ID"), `password_hash`, `buddy`, optional unique `email`, `name`, plus the taste profile (`diets`, `avoid_allergens`, `favorite_cuisines`) — table is `app_user`, since `user` is reserved in Postgres |
+| `GroceryItem` | belongs to one user; `expires_on`, `quantity`/`unit`, `category`, `price`, the shelf fields `shelf_life_days`, `spoilage_profile`, `shelf_buddy`, and how it ended: `consumed`, `outcome`, `resolved_on`, `rescued` |
 | `Friend` | association entity between two users: `user_id`, `friend_id`, `status` (`pending`/`accepted`/`blocked`) |
 | `Feast` | a planned meal: `name`, host, optional `scheduled_for`, and a **snapshot** of the chosen recipe (JSONB) |
 | `FeastAttendee` | association entity: one person invited to one feast, with their `response` (`invited`/`accepted`/`declined`) |
@@ -58,15 +58,134 @@ are never returned.
 curl "localhost:8000/users/1/grocery-items/expiring?within_days=5&include_friends=true"
 ```
 
-**Users** — `POST /users`, `GET /users`, `GET|PATCH|DELETE /users/{id}`
+**Accounts** — `POST /auth/signup` (same handler as `POST /users`),
+`POST /auth/login`, `PUT /users/{id}/password`
+
+**Users** — `GET /users` (`?username=` for an exact User ID lookup),
+`GET|PATCH|DELETE /users/{id}`, `GET|PUT /users/{id}/taste-profile`
+
+**Shelf** — `GET /users/{id}/shelf`,
+`GET /grocery-items/freshness-preview?name=`,
+`POST /grocery-items/{id}/resolve` (used/wasted)
+
+**Waste and spending** — `GET /users/{id}/stats?period=weeks|months&buckets=6`
 
 **Grocery items** — `POST|GET /users/{user_id}/grocery-items` (list filters:
 `category`, `consumed`, `expires_before`), `GET|PATCH|DELETE /grocery-items/{id}`
 
-**Friends** — `POST /users/{user_id}/friends` (request),
+**Friends** — `POST /users/{user_id}/friends` (request by id),
+`POST /users/{user_id}/friends/invite` (request by User ID),
 `GET /users/{user_id}/friends?status=accepted`,
+`GET /users/{user_id}/friends/{friend_id}/shelf` (their yellow/red buddies, no prices),
 `PATCH /users/{user_id}/friends/{friend_id}` (accept/block),
 `DELETE /users/{user_id}/friends/{friend_id}`
+
+## Accounts
+
+The join screen collects a User ID, a password and a buddy — no email:
+
+```bash
+curl -X POST localhost:8000/auth/signup -H 'content-type: application/json' \
+     -d '{"username": "pantry.pal", "password": "cold-storage-9", "buddy": "carl"}'
+```
+
+`username` is the login handle and how friends find each other. It is stored
+lowercased, must be 3-40 characters of letters, digits, dot, dash or
+underscore, and is unique. `email` is still accepted and still unique, but it
+is optional: nothing on the screen asks for one, and the in-app inbox does not
+need it. `name` defaults to the User ID until the profile screen sets one.
+`buddy` is one of `sammy`, `milo`, `eddie`, `carl`, `bella`.
+
+Passwords are stored as PBKDF2-HMAC-SHA256 (240k iterations, per-password
+salt, stdlib only — no native build step) and never come back out of the API.
+`POST /auth/login` checks them and returns the user. A wrong password and an
+unknown User ID give the same 401, so accounts cannot be enumerated.
+
+**There are still no session tokens.** Login verifies credentials and hands
+back the user; every other endpoint takes `user_id` in the path, unauthenticated.
+Issuing a token is a change to `app/routers/auth.py` plus a dependency on the
+other routers — the stored credentials are already in the right shape for it.
+
+## Taste profile
+
+The second onboarding screen — diets, allergens and loved cuisines:
+
+```bash
+curl -X PUT localhost:8000/users/1/taste-profile -H 'content-type: application/json' \
+     -d '{"diets": ["Pescatarian"], "avoid_allergens": ["Peanuts"],
+          "favorite_cuisines": ["Italian", "Mexican"]}'
+```
+
+The labels the UI shows are accepted as-is (`"Gluten-free"` → `gluten_free`,
+`"Tree nuts"` → `tree_nuts`). Diets are `vegetarian`, `vegan`, `pescatarian`,
+`gluten_free`, `dairy_free`; allergens are `peanuts`, `shellfish`, `tree_nuts`,
+`sesame`. Cuisines are free text, title-cased and de-duplicated.
+
+Each list **replaces** the previous one rather than merging — de-selecting the
+last chip has to stick. Omit a field to leave it alone.
+
+All three live on `app_user` as JSON columns: short fixed lists, always read
+with the user, never queried on their own. Three join tables would buy nothing.
+
+**Allergens are enforced, not merely suggested** — see
+[Recipe suggestions](#recipe-suggestions).
+
+## The shelf
+
+`GET /users/{id}/shelf` is the home screen in one call: every unconsumed item
+with its freshness chip, plus the counts printed above them.
+
+```json
+{ "user_id": 1, "fresh": 3, "use_soon": 1, "use_now": 2, "expired": 1,
+  "needs_rescue": 3, "rescue_value": 6.99,
+  "items": [ { "name": "Spinach", "price": 3.49, "expires_on": "2026-09-26",
+               "shelf_life_days": 7, "spoilage_profile": "gradual",
+               "shelf_buddy": "leaf", "days_until_expiry": 2,
+               "freshness": "use_now", "freshness_label": "2 days" } ] }
+```
+
+`days_until_expiry`, `freshness` and `freshness_label` are **derived on read**,
+never stored — they are a function of today's date, so a stored copy is wrong
+by morning. The bands: `use_now` ≤ 2 days, `use_soon` ≤ 5 days, `fresh` beyond
+that, `expired` past the date, `unknown` when no date is recorded.
+`needs_rescue` is `use_now + expired`, and `rescue_value` totals their prices.
+
+### Adding an ingredient
+
+Only `name` is required. Everything else the add sheet shows is filled in:
+
+```bash
+curl -X POST localhost:8000/users/1/grocery-items -H 'content-type: application/json' \
+     -d '{"name": "Spinach", "price": 3.49}'
+```
+
+- `purchased_on` defaults to today — the freshness timer starts when it was
+  bought, not when it was typed in. Back-date it and the expiry moves with it.
+- `shelf_life_days`, `spoilage_profile` (`gradual`/`sudden`/`stable`),
+  `shelf_buddy` and `category` come from the catalogue in `app/freshness.py`.
+- `expires_on` is `purchased_on + shelf_life_days`. An explicit `expires_on`
+  always wins — a date read off the packet beats anything inferred from a name.
+  Send `"expires_on": null` for something with no timer at all (salt, sugar).
+
+`GET /grocery-items/freshness-preview?name=Spinach` returns exactly what saving
+would store, so the sheet can show it while the user is still typing:
+
+```json
+{ "name": "Spinach", "shelf_life_days": 7, "spoilage_profile": "gradual",
+  "shelf_buddy": "leaf", "category": "produce", "expires_on": "2026-09-27",
+  "summary": "Gradual · ~7 days" }
+```
+
+**Why a static catalogue and not the LLM.** The preview has to answer on every
+keystroke; a round-trip there would be slow, billed, and would not give the
+same answer twice. The answer for "spinach" does not change. Anything not in
+the catalogue falls back to 7 days / `gradual` / `leaf` — deliberately short,
+since over-estimating shelf life is how food quietly rots.
+
+The values are copied onto the row at write time rather than re-derived on
+read: editing the catalogue later must not silently move an existing item's
+expiry date. `shelf_buddy` is one of the keys in `freshness.BUDDY_KEYS`, which
+a test pins so the catalogue cannot invent a sprite the front end has no art for.
 
 ## Onboarding & ingredients
 
@@ -139,6 +258,103 @@ python -m scripts.check_llm                   # the configured LLM_MODEL
 python -m scripts.check_llm some/other-model  # try a different one
 ```
 
+## The You screen
+
+### Account
+
+`PATCH /users/{id}` changes the User ID (and name, buddy, email);
+`PUT /users/{id}/password` changes the password. Both report a taken User ID as
+a 409 naming *which* field clashed, since email and User ID are both unique and
+only one of them is on the screen.
+
+Changing a User ID is safe: it is a display handle, not the row key, so
+friendships, items and feasts all point at `id` and nothing moves with it.
+
+### Friends
+
+The invite box collects a handle, not an internal id:
+
+```bash
+curl -X POST localhost:8000/users/1/friends/invite \
+     -H 'content-type: application/json' -d '{"username": "maya.cooks"}'
+```
+
+`GET /users/{id}/friends` carries `needs_rescue` per row — the "2 buddies need
+rescuing" line — counted for every friend in **one** query rather than one per
+row.
+
+`GET /users/{id}/friends/{friend_id}/shelf` is what a friend may see:
+
+- **Only the yellow and red buddies.** A friend is being shown what needs
+  cooking, not an inventory of someone's fridge.
+- **Never a price.** The screen promises "prices stay private", so the response
+  model (`FriendShelfItem`) has no price field at all — the promise cannot be
+  broken by forgetting to strip one.
+- **Accepted friendships only.** Pending or blocked is a 403, not a peek.
+
+### Waste and spending
+
+```bash
+curl "localhost:8000/users/1/stats?period=weeks&buckets=6"
+```
+
+```json
+{ "spent": 312.00, "wasted": 26.90, "rescued": 39.85,
+  "buckets": [ {"label": "W1", "starts_on": "2026-08-10", "ends_on": "2026-08-16",
+                "spent": 48.00, "wasted": 8.16, "spent_and_used": 39.84,
+                "rescued": 3.25, "items_wasted": 1, "items_rescued": 1} ],
+  "waste_percent_first": 17.0, "waste_percent_last": 2.1,
+  "summary": "Waste is down from 17% of spending to 2.1% over 6 weeks.",
+  "priced_items": 64, "unpriced_items": 0 }
+```
+
+`spent_and_used` and `wasted` are the two parts of each stacked bar, and sum to
+`spent`. Weeks run Monday-Sunday with the current week last; months are
+calendar months.
+
+**Spending is attributed to when something was bought, waste and rescues to
+when they were resolved.** An item bought in W1 and binned in W3 is W1's
+spending and W3's waste — which is how anyone reading the chart would expect it
+to behave. (`spent_and_used` is clamped at zero, since a bar can contain waste
+from something bought before the window.)
+
+**Items with no price are reported, not treated as free.** They come back in
+`unpriced_items` rather than quietly dragging every total down.
+
+**The trend compares the earliest bucket that has spending in it**, not
+literally the first bar. A month from before the user joined is 0% waste only
+because it is empty, and "waste is up from 0%" is a misreading of an empty bar.
+With fewer than two such buckets there is no trend to report and `summary` says
+so instead of inventing one.
+
+### Why `outcome` exists
+
+`consumed` was a single flag: gone. The whole point of this screen is the
+difference between *eaten* and *binned*, which that flag cannot express. So an
+item now ends its life through:
+
+```bash
+curl -X POST localhost:8000/grocery-items/12/resolve \
+     -H 'content-type: application/json' -d '{"outcome": "wasted"}'
+```
+
+| field | meaning |
+| --- | --- |
+| `outcome` | `on_shelf`, `used` (eaten) or `wasted` (binned) |
+| `resolved_on` | when it left the shelf — defaults to today |
+| `rescued` | it was *used* while already in the use-now or expired band |
+
+`rescued` is decided at the moment of the change, not derived later: once an
+item is off the shelf, its expiry date no longer says how close a call it was.
+
+This is also why the shelf resolves items instead of deleting them — **a
+deleted row cannot be counted as waste**, and the chart would flatter the user
+every time they tidied up.
+
+`consumed` is kept and moved in step, so existing callers keep working:
+`PATCH {"consumed": true}` records `used`, and setting it back to false clears
+the outcome and puts the item back on the shelf.
+
 ## Recipe suggestions
 
 What could these people cook together, right now?
@@ -190,6 +406,8 @@ The rules, and where each is enforced:
 
 | Rule | Enforced |
 | --- | --- |
+| Never suggest anything containing a group allergen | **In code**, after the model replies |
+| Never suggest a dish breaking a group diet | **In code**, after the model replies |
 | Never suggest a dish anyone in the group dislikes | **In code**, after the model replies |
 | Rank liked dishes first | In code (`is_liked` is matched against the DB, not claimed by the model) |
 | Fall back to other dishes when no liked one is cookable | In code — `detail` says so |
@@ -206,6 +424,28 @@ drives the ranking — and the ordering itself.
 
 Expired and consumed groceries are excluded from the pantry: a recipe built on
 food that has already gone off is worse than no suggestion.
+
+### Allergies and diets
+
+The onboarding screen promises allergens "never show up in your recipes, or in
+Feast recipes with friends", so they are checked twice: the prompt is told, and
+every suggestion is then matched against the keyword lists in `app/dietary.py`
+before it reaches the client. A hit drops the suggestion outright — the
+response reports `excluded_for_dietary_rules` and, if nothing survives, says so
+in `detail`. The check covers the dish name, what it uses *and* what is still
+to buy: tahini in the shopping list is still sesame.
+
+Constraints are pooled across everyone eating and every one of them applies:
+one person's peanut allergy rules peanuts out of the shared meal, and the
+strictest diet in the group is the one the meal has to satisfy.
+
+`POST /feasts` re-runs the same check against the actual guest list, because
+the suggestion was filtered for whoever it was generated for — which may be a
+different set, or the same one after somebody added an allergy. A clash is a
+422 naming the offending ingredient rather than a feast nobody can eat.
+
+Favourite cuisines are the soft counterpart: they go into the prompt as a
+preference and never exclude anything.
 
 **A dislike outranks a like.** If one person likes a dish and another dislikes
 it, it is excluded — the meal is shared.
@@ -294,6 +534,12 @@ are **relative to the day you run it**, so a handful of items are always
 expired, expiring today, and expiring this week — the `/expiring` endpoints
 stay interesting without re-seeding.
 
+Every demo account shares the password `fridge-friends-demo` (User IDs
+`sam.perera`, `nadia.k`, `theo.a`, `mei.t`, `obi.n`), so the join screen can be
+exercised against seeded data. Two accounts carry a taste profile, which is
+what makes the allergen filtering visible: Nadia is vegetarian and allergic to
+peanuts, Mei avoids shellfish, Obi is dairy-free.
+
 Every demo account is on `@grocerydemo.dev`, and `--reset` deletes only those
 accounts. It never truncates tables, so it is safe to run against a database
 that also holds real rows.
@@ -321,10 +567,19 @@ and at anything needing a data backfill. The `food_preference` migration is
 hand-written for exactly that reason — autogenerating the `favorite_food`
 rename would have dropped every row.
 
-Two gotchas already handled: SQLite can't `ALTER` a column, so `env.py` turns on
-`render_as_batch` for SQLite only; and Postgres keeps an enum type after its
+The history here is not linear by accident: `d82a3e9a4925` was written in a
+second working copy of this repo and applied to Supabase without being
+committed, so `c4a17e9b52d1` was rebased onto it rather than branching from the
+same parent. Keep new revisions on one chain — alembic cannot upgrade a
+database sitting on a revision it has never heard of.
+
+Three gotchas already handled. SQLite can't `ALTER` a column, so `env.py` turns
+on `render_as_batch` for SQLite only. Postgres keeps an enum type after its
 table is dropped, so the initial migration's `downgrade()` drops `friendstatus`
-explicitly.
+explicitly. And batch mode on SQLite rebuilds a table by dropping it — which
+fires `grocery_item`'s `ON DELETE CASCADE` and silently empties the table — so
+`c4a17e9b52d1` turns foreign keys off around its batch operations, inside an
+`autocommit_block()` because SQLite ignores that PRAGMA within a transaction.
 
 ## Notes
 
@@ -334,5 +589,7 @@ any OpenAI-compatible `LLM_BASE_URL` works, and switching models is a one-line
 change in `.env`. (`z-ai/glm-5.3` is listed by that endpoint but never
 responded during development — requests disconnect at 60s.)
 
-There is no auth — `user_id` in the path is the acting user. Add a real auth
-dependency before exposing this beyond local use.
+Passwords are stored and checked, but there are no session tokens yet:
+`user_id` in the path is still the acting user, and no endpoint verifies who is
+calling. Add a token and an auth dependency before exposing this beyond local
+use.

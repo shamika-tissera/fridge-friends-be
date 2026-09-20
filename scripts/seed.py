@@ -13,11 +13,14 @@ import argparse
 import sys
 from datetime import date, timedelta
 
-from sqlmodel import Session, col, select
+from sqlmodel import Session, col, or_, select
 
 from app.database import DATABASE_URL, engine
+from app.freshness import expiry_from, profile_for
+from app.security import hash_password
 from app.services import normalise
 from app.models import (
+    Buddy,
     Feast,
     FeastAttendee,
     FoodPreference,
@@ -33,12 +36,32 @@ from app.models import (
 # instead of truncating tables that may hold real rows.
 SEED_DOMAIN = "@grocerydemo.dev"
 
+# (email, display name, User ID, buddy, diets, allergens, cuisines)
+# Every demo account shares one password, so the join screen can be exercised
+# against seeded data: see SEED_PASSWORD.
 USERS = [
-    ("sam" + SEED_DOMAIN, "Sam Perera"),
-    ("nadia" + SEED_DOMAIN, "Nadia Khan"),
-    ("theo" + SEED_DOMAIN, "Theo Alvarez"),
-    ("mei" + SEED_DOMAIN, "Mei Tanaka"),
-    ("obi" + SEED_DOMAIN, "Obi Nwachukwu"),
+    ("sam" + SEED_DOMAIN, "Sam Perera", "sam.perera", "sammy",
+     [], [], ["Italian", "Thai"]),
+    ("nadia" + SEED_DOMAIN, "Nadia Khan", "nadia.k", "milo",
+     ["vegetarian"], ["peanuts"], ["Indian", "Mediterranean"]),
+    ("theo" + SEED_DOMAIN, "Theo Alvarez", "theo.a", "carl",
+     [], [], ["Italian", "Mexican"]),
+    ("mei" + SEED_DOMAIN, "Mei Tanaka", "mei.t", "eddie",
+     [], ["shellfish"], ["Korean", "Japanese"]),
+    ("obi" + SEED_DOMAIN, "Obi Nwachukwu", "obi.n", "bella",
+     ["dairy_free"], [], ["West African"]),
+]
+
+SEED_PASSWORD = "fridge-friends-demo"
+
+# Accounts created the way the join screen creates them: a User ID and a
+# password, no email. (handle, User ID, display name, buddy, diets, allergens,
+# cuisines) — `handle` is the key the rest of this script refers to them by.
+EMAILLESS_USERS = [
+    ("pal", "pantry.pal", "Pantry Pal", "carl",
+     ["pescatarian"], ["peanuts"], ["Italian", "Mexican"]),
+    ("rae", "rae.cooks", "Rae", "bella",
+     ["gluten_free"], ["tree_nuts", "sesame"], ["Korean"]),
 ]
 
 # (requester, addressee, status)
@@ -48,6 +71,8 @@ FRIENDSHIPS = [
     ("nadia", "mei", FriendStatus.accepted),
     ("theo", "mei", FriendStatus.pending),   # not yet accepted
     ("sam", "obi", FriendStatus.pending),    # not yet accepted
+    ("pal", "sam", FriendStatus.accepted),
+    ("pal", "rae", FriendStatus.accepted),
     ("mei", "obi", FriendStatus.blocked),
 ]
 
@@ -71,7 +96,8 @@ FEASTS = [
 ]
 
 # (owner, name, qty, unit, category, days_until_expiry, days_since_purchase, consumed)
-# days_until_expiry None => pantry staple with no expiry date.
+# days_until_expiry None => let the freshness catalogue decide, the way the add
+# sheet does: purchased_on + the ingredient's shelf life.
 ITEMS = [
     ("sam", "Whole milk",        1,   "L",    "dairy",    -2,  9, False),
     ("sam", "Baby spinach",      200, "g",    "produce",  -1,  6, False),
@@ -108,6 +134,20 @@ ITEMS = [
     ("obi", "Plantain",          4,   "ct",   "produce",   3,  2, False),
     ("obi", "Scotch bonnets",    100, "g",    "produce",   6,  2, False),
     ("obi", "Egusi",             500, "g",    "pantry",  240, 35, False),
+
+    # The two join-screen accounts. Their expiry dates are left to the
+    # catalogue (None below), so their shelves show derived shelf lives.
+    ("pal", "Spinach",           200, "g",    "produce",  None, 0, False),
+    ("pal", "Salmon fillet",     2,   "ct",   "seafood",  None, 0, False),
+    ("pal", "Whole milk",        1,   "L",    "dairy",    None, 4, False),
+    ("pal", "Lemon",             3,   "ct",   "produce",  None, 0, False),
+    ("pal", "Canned tomatoes",   400, "g",    "pantry",   None, 0, False),
+    ("pal", "Eggplant",          1,   "ct",   "produce",  None, 5, False),
+
+    ("rae", "Baby spinach",      150, "g",    "produce",  None, 6, False),
+    ("rae", "Greek yogurt",      500, "g",    "dairy",    None, 12, False),
+    ("rae", "Basmati rice",      1,   "kg",   "pantry",   None, 20, False),
+    ("rae", "Scotch bonnets",    50,  "g",    "produce",  None, 3, False),
 ]
 
 
@@ -116,9 +156,19 @@ def handle(email_prefix: str) -> str:
 
 
 def reset(session: Session) -> int:
-    """Delete the demo users. Items and friendships cascade away with them."""
+    """Delete the demo users. Items and friendships cascade away with them.
+
+    Matched on the demo email domain, plus the User IDs of the accounts seeded
+    without an email — those have nothing else to identify them by.
+    """
+    emailless = [username for _, username, *_ in EMAILLESS_USERS]
     doomed = session.exec(
-        select(User).where(col(User.email).like("%" + SEED_DOMAIN))
+        select(User).where(
+            or_(
+                col(User.email).like("%" + SEED_DOMAIN),
+                col(User.username).in_(emailless),
+            )
+        )
     ).all()
     for user in doomed:
         session.delete(user)
@@ -130,10 +180,34 @@ def seed(session: Session) -> dict[str, User]:
     today = date.today()
 
     users: dict[str, User] = {}
-    for email, name in USERS:
-        user = User(email=email, name=name)
+    for email, name, username, buddy, diets, allergens, cuisines in USERS:
+        user = User(
+            email=email,
+            name=name,
+            username=username,
+            buddy=Buddy(buddy),
+            password_hash=hash_password(SEED_PASSWORD),
+            diets=diets,
+            avoid_allergens=allergens,
+            favorite_cuisines=cuisines,
+        )
         session.add(user)
         users[email.split("@")[0]] = user
+
+    for key, username, name, buddy, diets, allergens, cuisines in EMAILLESS_USERS:
+        user = User(
+            email=None,
+            name=name,
+            username=username,
+            buddy=Buddy(buddy),
+            password_hash=hash_password(SEED_PASSWORD),
+            diets=diets,
+            avoid_allergens=allergens,
+            favorite_cuisines=cuisines,
+        )
+        session.add(user)
+        users[key] = user
+
     session.flush()  # assign ids without ending the transaction
 
     for requester, addressee, status in FRIENDSHIPS:
@@ -146,14 +220,24 @@ def seed(session: Session) -> dict[str, User]:
         )
 
     for owner, name, qty, unit, category, expires_in, bought_ago, consumed in ITEMS:
+        # The buddy and spoilage profile come from the same catalogue the API
+        # uses, so seeded shelves render exactly like added ones.
+        entry = profile_for(name)
         session.add(
             GroceryItem(
                 name=name,
                 quantity=qty,
                 unit=unit,
                 category=category,
-                expires_on=None if expires_in is None else today + timedelta(days=expires_in),
+                price=round(2.0 + (len(name) % 7) * 0.75, 2),
+                expires_on=(
+                    today + timedelta(days=expires_in) if expires_in is not None
+                    else expiry_from(today - timedelta(days=bought_ago), entry.shelf_life_days)
+                ),
                 purchased_on=today - timedelta(days=bought_ago),
+                shelf_life_days=entry.shelf_life_days,
+                spoilage_profile=entry.spoilage_profile,
+                shelf_buddy=entry.buddy,
                 consumed=consumed,
                 owner_id=users[owner].id,
             )

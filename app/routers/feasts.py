@@ -8,6 +8,7 @@ from sqlmodel import Session, col, select
 
 from app import database
 from app.database import get_session
+from app.dietary import rules_for
 from app.models import (
     DeliveryStatus,
     Feast,
@@ -66,6 +67,7 @@ def to_read(session: Session, feast: Feast) -> FeastRead:
         attendees=[
             AttendeeRead(
                 user_id=user.id,
+                username=user.username,
                 name=user.name,
                 email=user.email,
                 response=row.response,
@@ -105,6 +107,22 @@ def create_feast(
     attendee_ids = list(dict.fromkeys([payload.host_id, *payload.attendee_ids]))
     for uid in attendee_ids:
         get_user_or_404(uid, session)   # 404 before anything is written
+
+    # Re-check the recipe against everyone who will eat it. The suggestion was
+    # filtered for whoever it was generated for, and this guest list can be a
+    # different set — or the same one after somebody added an allergy.
+    rules = rules_for(session, attendee_ids)
+    violations = rules.violations(
+        [payload.recipe.name]
+        + [ingredient.name for ingredient in payload.recipe.uses]
+        + payload.recipe.missing
+    )
+    if violations:
+        raise HTTPException(
+            422,   # the constant was renamed between Starlette versions
+            "This recipe clashes with an attendee's allergies or diet: "
+            + ", ".join(sorted(set(violations))),
+        )
 
     feast = create_feast_record(
         session,
