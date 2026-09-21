@@ -13,7 +13,10 @@ from app.models import (
     DeliveryStatus,
     Feast,
     FeastAttendee,
+    FeastStatus,
+    GroceryItem,
     InviteResponse,
+    ItemOutcome,
     Notification,
     User,
 )
@@ -21,9 +24,12 @@ from app.notifications import format_invitation, notify_feast_invitations
 from app.routers.users import get_user_or_404
 # Aliased: this module's own endpoint is also called create_feast.
 from app.services import create_feast as create_feast_record
+from app.services import normalise, resolve_item
 from app.schemas import (
     AttendeeRead,
     FeastCreate,
+    FeastOutcomeResult,
+    FeastOutcomeUpdate,
     FeastRead,
     InviteResponseUpdate,
     NotificationRead,
@@ -62,6 +68,8 @@ def to_read(session: Session, feast: Feast) -> FeastRead:
         name=feast.name,
         host_id=feast.host_id,
         host_name=host.name if host else "",
+        status=feast.status,
+        outcome_at=feast.outcome_at,
         scheduled_for=feast.scheduled_for,
         recipe=feast.recipe,
         attendees=[
@@ -225,3 +233,107 @@ def mark_notification_read(
         session.commit()
         session.refresh(notification)
     return notification
+
+
+@router.post("/feasts/{feast_id}/outcome", response_model=FeastOutcomeResult)
+def set_feast_outcome(
+    feast_id: int,
+    payload: FeastOutcomeUpdate,
+    session: Session = Depends(get_session),
+):
+    """Record how a feast turned out. **Host only.**
+
+    `rescued` also books the groceries it used: each one is marked eaten and
+    attributed to this feast, which is what moves it from `rescued_solo` to
+    `rescued_friends` in `GET /users/{id}/stats`.
+
+    Which groceries? `item_ids` if you send them; otherwise the recipe snapshot
+    is matched by name against the attendees' shelves, since the snapshot
+    already records what the meal was made of and whose kitchen each part came
+    from. Items belonging to people who are not attending are skipped rather
+    than refused — a guest list can change after the recipe was chosen.
+
+    Whether an item counts as a *rescue* is unchanged: it must have been in the
+    use-now or expired band when it was eaten. A feast that used up a bag of
+    rice bought yesterday was a feast, not a rescue, and `items_rescued` in the
+    response says how many of the items actually qualified.
+
+    The response carries **no prices**. The host acts on other attendees'
+    groceries here, and what those cost stays private to their owner.
+    """
+    feast = get_feast_or_404(feast_id, session)
+    if payload.host_id != feast.host_id:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "Only the host can record a feast outcome"
+        )
+
+    feast.status = payload.status
+    feast.outcome_at = datetime.now(timezone.utc)
+    session.add(feast)
+
+    resolved: list[GroceryItem] = []
+    if payload.status == FeastStatus.rescued:
+        attendee_ids = [
+            row.user_id
+            for row in session.exec(
+                select(FeastAttendee).where(col(FeastAttendee.feast_id) == feast_id)
+            ).all()
+        ]
+        resolved = _items_for_feast(session, feast, attendee_ids, payload.item_ids)
+        for item in resolved:
+            resolve_item(item, ItemOutcome.used, feast_id=feast.id)
+            session.add(item)
+
+    session.commit()
+    session.refresh(feast)
+
+    owners = {item.owner_id for item in resolved}
+    names = [
+        user.name
+        for user in session.exec(select(User).where(col(User.id).in_(owners))).all()
+    ] if owners else []
+
+    return FeastOutcomeResult(
+        feast=to_read(session, feast),
+        items_used=len(resolved),
+        items_rescued=sum(1 for item in resolved if item.rescued),
+        item_ids=[item.id for item in resolved],
+        owners=names,
+    )
+
+
+def _items_for_feast(
+    session: Session,
+    feast: Feast,
+    attendee_ids: list[int],
+    item_ids: list[int] | None,
+) -> list[GroceryItem]:
+    """The groceries a feast ate: the ones named, or the ones its recipe implies.
+
+    Only ever returns unconsumed items belonging to attendees. Resolving an
+    item twice would move an earlier rescue onto this feast and double-count
+    it, so anything already off the shelf is left alone.
+    """
+    if not attendee_ids:
+        return []
+
+    statement = (
+        select(GroceryItem)
+        .where(col(GroceryItem.owner_id).in_(attendee_ids))
+        .where(col(GroceryItem.consumed) == False)  # noqa: E712
+    )
+    if item_ids:
+        # An id that is not on an attendee's shelf simply does not come back.
+        return list(session.exec(statement.where(col(GroceryItem.id).in_(item_ids))).all())
+
+    # Fall back to the snapshot: it lists exactly what the meal used.
+    wanted = {
+        normalise(ingredient.get("name", ""))
+        for ingredient in (feast.recipe or {}).get("uses", [])
+        if ingredient.get("name")
+    }
+    if not wanted:
+        return []
+    return [
+        item for item in session.exec(statement).all() if normalise(item.name) in wanted
+    ]

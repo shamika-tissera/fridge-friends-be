@@ -257,3 +257,28 @@ def test_single_period_of_history_says_so(client, make_user):
 
     body = client.get(f"/users/{uid}/stats").json()
     assert body["summary"] == "Not enough history yet — 100% of spending wasted so far."
+
+
+# ---------- CORS ----------
+def test_browser_preflight_is_answered(client):
+    """A front end on another origin must get past the preflight.
+
+    Without CORS middleware this is a 405 and the browser never sends the real
+    request — which looks like an unreachable backend, with nothing in the logs.
+    """
+    resp = client.options(
+        "/auth/login",
+        headers={
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["access-control-allow-origin"] == "*"
+
+
+def test_actual_response_carries_the_origin_header(client, make_user):
+    make_user("cors@example.com", username="cors.user")
+    resp = client.get("/health", headers={"Origin": "http://localhost:3000"})
+    assert resp.headers.get("access-control-allow-origin") == "*"

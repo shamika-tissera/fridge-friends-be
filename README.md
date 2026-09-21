@@ -32,7 +32,7 @@ pytest     # always runs on in-memory sqlite, never touches your real DB
 | `User` | `id`, unique `username` (the "User ID"), `password_hash`, `buddy`, optional unique `email`, `name`, plus the taste profile (`diets`, `avoid_allergens`, `favorite_cuisines`) — table is `app_user`, since `user` is reserved in Postgres |
 | `GroceryItem` | belongs to one user; `expires_on`, `quantity`/`unit`, `category`, `price`, the shelf fields `shelf_life_days`, `spoilage_profile`, `shelf_buddy`, and how it ended: `consumed`, `outcome`, `resolved_on`, `rescued` |
 | `Friend` | association entity between two users: `user_id`, `friend_id`, `status` (`pending`/`accepted`/`blocked`) |
-| `Feast` | a planned meal: `name`, host, optional `scheduled_for`, and a **snapshot** of the chosen recipe (JSONB) |
+| `Feast` | a planned meal: `name`, host, optional `scheduled_for`, a **snapshot** of the chosen recipe (JSONB), and its `status` (`planned`/`rescued`/`failed`) with `outcome_at` |
 | `FeastAttendee` | association entity: one person invited to one feast, with their `response` (`invited`/`accepted`/`declined`) |
 | `Notification` | a user's in-app message, with `delivery_status` for the outbound channel |
 | `FoodPreference` | a food the user likes **or dislikes** + its LLM-generated `ingredients` (JSONB), with `preference`, `cuisine` and an `ingredient_status` |
@@ -327,6 +327,36 @@ because it is empty, and "waste is up from 0%" is a misreading of an empty bar.
 With fewer than two such buckets there is no trend to report and `summary` says
 so instead of inventing one.
 
+
+### Solo vs friends rescues
+
+`rescued` splits by where the food was eaten. Pass `feast_id` when resolving:
+
+```bash
+curl -X POST localhost:8000/grocery-items/12/resolve \
+     -H 'content-type: application/json' \
+     -d '{"outcome": "used", "feast_id": 4}'
+```
+
+Every bucket and the top-level totals carry the split:
+
+| field | meaning |
+| --- | --- |
+| `rescued_solo` / `rescued_friends` | money, and they sum to `rescued` |
+| `items_rescued_solo` / `items_rescued_friends` | counts, and they sum to `items_rescued` |
+
+A missing `feast_id` means solo — which is also what every rescue recorded
+before feasts were tracked was, so old rows need no backfill and read
+correctly.
+
+`feast_id` is checked: the feast must exist (404) and the item's owner must
+actually be going to it (422). Without that, any id at all would land in
+`rescued_friends` and the split would be whatever a client felt like claiming.
+
+Attribution is stored for any outcome, not just rescues — food binned after a
+feast is still food that feast is answerable for — but only rescues are ever
+split by it.
+
 ### Why `outcome` exists
 
 `consumed` was a single flag: gone. The whole point of this screen is the
@@ -343,6 +373,7 @@ curl -X POST localhost:8000/grocery-items/12/resolve \
 | `outcome` | `on_shelf`, `used` (eaten) or `wasted` (binned) |
 | `resolved_on` | when it left the shelf — defaults to today |
 | `rescued` | it was *used* while already in the use-now or expired band |
+| `rescued_feast_id` | the feast that ate it; **null means solo** |
 
 `rescued` is decided at the moment of the change, not derived later: once an
 item is off the shelf, its expiry date no longer says how close a call it was.
@@ -481,6 +512,41 @@ Endpoints: `POST /feasts`, `GET /feasts/{id}`, `GET /users/{id}/feasts`
 (`?hosting_only=true`), `POST /feasts/{id}/respond/{user_id}` (accept/decline),
 `POST /feasts/{id}/resend-invitations`.
 
+### Feast outcomes
+
+A feast starts `planned`. The host records how it went:
+
+```bash
+curl -X POST localhost:8000/feasts/4/outcome -H 'content-type: application/json' \
+     -d '{"host_id": 1, "status": "rescued"}'
+```
+
+**Host only** — anyone else gets a 403 — and a feast cannot be set back to
+`planned`, since "it has not happened yet" is not something you learn later.
+
+`rescued` also books the groceries it used: each is marked eaten and attributed
+to the feast, which is what moves it into `rescued_friends`. Which groceries?
+
+- `item_ids` if you send them.
+- Otherwise the recipe snapshot is matched by name against the attendees'
+  shelves. The snapshot already records what the meal was made of, so it is the
+  natural source; it is also why a feast created before its ingredients were
+  added matches nothing (`uses` only ever contains things somebody had).
+
+Items belonging to people who are not attending are skipped rather than
+refused — a guest list can change after the recipe was chosen. Items already
+off the shelf are skipped too, so recording the outcome twice does not move an
+earlier rescue onto this feast and count it again.
+
+**Being at a feast does not by itself make something a rescue.** The rule is
+unchanged: the item had to be in the use-now or expired band when it was eaten.
+A feast that used up a bag of rice bought yesterday was a feast, not a rescue.
+The response reports `items_used` and `items_rescued` separately so the app can
+say which happened.
+
+**The response carries no prices.** The host acts on other attendees' groceries
+here, and `FeastOutcomeResult` has no field for what any of it cost.
+
 ### Invitations
 
 Creating a feast writes a `notification` row per guest, then delivers them in
@@ -580,6 +646,42 @@ explicitly. And batch mode on SQLite rebuilds a table by dropping it — which
 fires `grocery_item`'s `ON DELETE CASCADE` and silently empties the table — so
 `c4a17e9b52d1` turns foreign keys off around its batch operations, inside an
 `autocommit_block()` because SQLite ignores that PRAGMA within a transaction.
+
+## Profile photos
+
+`avatar_url` is a nullable string on `UserRead` and `UserUpdate`:
+
+```bash
+curl -X PATCH localhost:8000/users/1 -H 'content-type: application/json' \
+     -d '{"avatar_url": "https://example.com/me.jpg"}'
+```
+
+Send `null` or `""` to clear it and fall back to the `buddy` sprite. Only
+`http://` and `https://` links are accepted — the app renders this straight
+into an image tag, so `javascript:` and `data:` URLs are refused here rather
+than trusted downstream.
+
+**This stores a link, not a file.** There is no upload endpoint, because there
+is no object storage wired up to put the bytes in: that needs an S3 or Supabase
+Storage bucket, credentials, and a signed-upload flow. Point this at whatever
+you already use for image hosting, or say the word and it can be added once a
+bucket exists.
+
+## CORS
+
+A browser front end on another origin needs this, and the symptom when it is
+missing is misleading: the preflight `OPTIONS` comes back `405`, the browser
+never sends the real request, and the server logs stay empty — so it reads as
+"the backend is unreachable" when the backend is fine.
+
+`CORS_ORIGINS` is a comma-separated list of allowed origins and defaults to
+`*`. Credentials are only enabled when an explicit list is given: the spec
+forbids pairing `allow_credentials` with `*`, and browsers reject that
+combination outright rather than falling back to something weaker.
+
+```bash
+CORS_ORIGINS=http://localhost:3000,https://fridge-friends.example
+```
 
 ## Notes
 

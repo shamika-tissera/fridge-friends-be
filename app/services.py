@@ -65,13 +65,22 @@ RESCUE_BANDS = (Freshness.use_now, Freshness.expired)
 
 
 def resolve_item(
-    item: GroceryItem, outcome: ItemOutcome, *, on: date | None = None
+    item: GroceryItem,
+    outcome: ItemOutcome,
+    *,
+    on: date | None = None,
+    feast_id: int | None = None,
 ) -> GroceryItem:
     """Mark an item used or wasted, and record whether using it was a rescue.
 
     `rescued` is decided here, at the moment of the change, because the band
     the item was in cannot be recovered afterwards — once it is off the shelf
     its expiry date says nothing about how close a call it was.
+
+    `feast_id` records *where* it was eaten, which is what separates a solo
+    rescue from one shared with friends. It is stored whatever the outcome —
+    food binned after a feast is still food that feast is answerable for — but
+    only rescues are ever split by it in the stats.
     """
     when = on or date.today()
     item.outcome = outcome
@@ -81,6 +90,7 @@ def resolve_item(
         outcome == ItemOutcome.used
         and band_for(days_until(item.expires_on, when)) in RESCUE_BANDS
     )
+    item.rescued_feast_id = feast_id
     return item
 
 
@@ -204,7 +214,12 @@ def waste_and_spending(
     ).all()
 
     totals = [
-        {"spent": 0.0, "wasted": 0.0, "rescued": 0.0, "items_wasted": 0, "items_rescued": 0}
+        {
+            "spent": 0.0, "wasted": 0.0, "rescued": 0.0,
+            "rescued_solo": 0.0, "rescued_friends": 0.0,
+            "items_wasted": 0, "items_rescued": 0,
+            "items_rescued_solo": 0, "items_rescued_friends": 0,
+        }
         for _ in spans
     ]
 
@@ -236,6 +251,11 @@ def waste_and_spending(
             elif item.rescued:
                 totals[resolved_at]["rescued"] += item.price
                 totals[resolved_at]["items_rescued"] += 1
+                # No feast on the row means it was eaten alone — which is also
+                # what every rescue recorded before feasts were tracked was.
+                where = "friends" if item.rescued_feast_id is not None else "solo"
+                totals[resolved_at][f"rescued_{where}"] += item.price
+                totals[resolved_at][f"items_rescued_{where}"] += 1
 
     rows: list[StatsBucket] = []
     for (start, end, label), t in zip(spans, totals):
@@ -249,7 +269,11 @@ def waste_and_spending(
                 # inside it is waste with no matching spend in the same bar.
                 spent_and_used=round(max(spent - wasted, 0.0), 2),
                 rescued=round(t["rescued"], 2),
+                rescued_solo=round(t["rescued_solo"], 2),
+                rescued_friends=round(t["rescued_friends"], 2),
                 items_wasted=t["items_wasted"], items_rescued=t["items_rescued"],
+                items_rescued_solo=t["items_rescued_solo"],
+                items_rescued_friends=t["items_rescued_friends"],
             )
         )
 
@@ -282,6 +306,13 @@ def waste_and_spending(
         spent=round(sum(r.spent for r in rows), 2),
         wasted=round(sum(r.wasted for r in rows), 2),
         rescued=round(sum(r.rescued for r in rows), 2),
+        # Summed from the rounded buckets, so the totals always agree with the
+        # bars the app draws rather than being a cent out from them.
+        rescued_solo=round(sum(r.rescued_solo for r in rows), 2),
+        rescued_friends=round(sum(r.rescued_friends for r in rows), 2),
+        items_rescued=sum(r.items_rescued for r in rows),
+        items_rescued_solo=sum(r.items_rescued_solo for r in rows),
+        items_rescued_friends=sum(r.items_rescued_friends for r in rows),
         waste_percent_first=first, waste_percent_last=last, summary=summary,
         priced_items=priced, unpriced_items=unpriced,
     )

@@ -5,7 +5,7 @@ from sqlmodel import Session, col, select
 
 from app.database import get_session
 from app.freshness import expiry_from, profile_for
-from app.models import GroceryItem, ItemOutcome
+from app.models import Feast, FeastAttendee, GroceryItem, ItemOutcome
 from app.routers.users import get_user_or_404
 from app.schemas import (
     ExpiringGroceryItem,
@@ -249,9 +249,32 @@ def resolve(
     This is what feeds the waste-and-spending screen, and it is why the shelf
     does not just delete things: a deleted row cannot be counted as waste.
     Using something that was already in the red is recorded as a rescue.
+
+    Pass `feast_id` when it was eaten with friends; leave it out for a solo
+    meal. That is the whole of the `rescued_solo` / `rescued_friends` split.
     """
     item = get_item_or_404(item_id, session)
-    resolve_item(item, payload.outcome, on=payload.resolved_on)
+
+    # A feast has to exist and actually involve the item's owner. Without the
+    # check, any id at all would land in `rescued_friends` and the split would
+    # be whatever the client felt like claiming.
+    if payload.feast_id is not None:
+        if session.get(Feast, payload.feast_id) is None:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, f"Feast {payload.feast_id} not found"
+            )
+        attending = session.exec(
+            select(FeastAttendee)
+            .where(col(FeastAttendee.feast_id) == payload.feast_id)
+            .where(col(FeastAttendee.user_id) == item.owner_id)
+        ).first()
+        if attending is None:
+            raise HTTPException(
+                422,   # the constant was renamed between Starlette versions
+                "The owner of this item is not going to that feast",
+            )
+
+    resolve_item(item, payload.outcome, on=payload.resolved_on, feast_id=payload.feast_id)
     session.add(item)
     session.commit()
     session.refresh(item)

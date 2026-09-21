@@ -70,6 +70,14 @@ class ItemOutcome(str, Enum):
     wasted = "wasted"   # thrown out
 
 
+class FeastStatus(str, Enum):
+    """How a feast turned out. Set by the host once it has happened."""
+
+    planned = "planned"   # agreed, not yet cooked
+    rescued = "rescued"   # it happened, and food got eaten instead of binned
+    failed = "failed"     # it fell through
+
+
 class Freshness(str, Enum):
     """The chip shown on the shelf. Derived from `expires_on`, never stored."""
 
@@ -120,6 +128,10 @@ class User(SQLModel, table=True):
     password_hash: Optional[str] = Field(default=None, max_length=255)
     buddy: Buddy = Field(default=Buddy.sammy)
 
+    # A photo the user points us at. There is no object storage wired up here,
+    # so the service stores the link and never the bytes.
+    avatar_url: Optional[str] = Field(default=None, max_length=500)
+
     # The onboarding screen's three multi-selects. They are short, fixed lists
     # always read together with the user, so they live here as JSON rather than
     # in three join tables that would never be queried independently.
@@ -167,6 +179,16 @@ class GroceryItem(SQLModel, table=True):
     # rather than derived later, because the band it was in is not recoverable
     # once the item is gone.
     rescued: bool = Field(default=False, index=True)
+
+    # Which feast used it up, if any. Null means it was eaten solo, which is
+    # what every row predating this column is: a nullable foreign key says
+    # "no feast" without needing a second flag to mean the same thing.
+    #
+    # SET NULL rather than CASCADE: deleting a feast must not delete somebody's
+    # grocery history. The rescue survives and counts as solo.
+    rescued_feast_id: Optional[int] = Field(
+        default=None, foreign_key="feast.id", index=True, ondelete="SET NULL"
+    )
 
     # What it cost, for the "you rescued $X of food" story. Float, like
     # quantity: these are display totals, never billed against.
@@ -269,6 +291,18 @@ class Feast(SQLModel, table=True):
     # suggestion call returns. Snapshotting also keeps the feast honest: it
     # records what was agreed to, even after pantries and preferences change.
     recipe: dict = Field(default_factory=dict, sa_column=Column(JSON_TYPE, nullable=False))
+
+    # server_default as well as the Python default: the column is NOT NULL, and
+    # a writer that predates this column (an older build mid-deploy) omits it
+    # entirely. Without a default in the schema that INSERT fails outright.
+    status: FeastStatus = Field(
+        default=FeastStatus.planned,
+        index=True,
+        sa_column_kwargs={"server_default": FeastStatus.planned.value},
+    )
+    outcome_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True)
+    )
 
     created_at: datetime = Field(default_factory=utcnow, sa_column=tz_column())
 

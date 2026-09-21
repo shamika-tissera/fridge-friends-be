@@ -9,6 +9,7 @@ from app.models import (
     Buddy,
     DeliveryStatus,
     Diet,
+    FeastStatus,
     Freshness,
     FriendStatus,
     IngredientStatus,
@@ -73,6 +74,27 @@ class UserUpdate(BaseModel):
     email: Optional[EmailStr] = None
     name: Optional[str] = Field(default=None, min_length=1, max_length=120)
     buddy: Optional[Buddy] = None
+    avatar_url: Optional[str] = Field(
+        default=None, max_length=500,
+        description="Link to a profile photo. Send null to go back to the buddy.",
+    )
+
+    @field_validator("avatar_url")
+    @classmethod
+    def only_web_urls(cls, value: Optional[str]) -> Optional[str]:
+        """Rejects anything that is not plain http(s).
+
+        The app renders this straight into an image tag, so `javascript:` and
+        `data:` URLs are refused here rather than trusted downstream.
+        """
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            return None
+        if not value.lower().startswith(("http://", "https://")):
+            raise ValueError("avatar_url must be an http:// or https:// link")
+        return value
 
     _check_username = field_validator("username")(UserCreate.normalise_username.__func__)
 
@@ -88,6 +110,7 @@ class UserRead(BaseModel):
     email: Optional[EmailStr]
     name: str
     buddy: Buddy
+    avatar_url: Optional[str] = None
     diets: list[Diet]
     avoid_allergens: list[Allergen]
     favorite_cuisines: list[str]
@@ -187,6 +210,9 @@ class GroceryItemRead(BaseModel):
     outcome: ItemOutcome
     resolved_on: Optional[date]
     rescued: bool
+    rescued_feast_id: Optional[int] = Field(
+        default=None, description="Set when it was eaten at a feast; null means solo"
+    )
     owner_id: int
     created_at: datetime
 
@@ -215,6 +241,12 @@ class ItemResolution(BaseModel):
     outcome: ItemOutcome = Field(description="`used` (eaten) or `wasted` (binned)")
     resolved_on: Optional[date] = Field(
         default=None, description="Defaults to today"
+    )
+    feast_id: Optional[int] = Field(
+        default=None,
+        description="The feast this was eaten at. Omit for a solo meal — that "
+                    "is what splits `rescued_solo` from `rescued_friends` in "
+                    "the stats. The owner must be an attendee.",
     )
 
     @field_validator("outcome")
@@ -266,8 +298,20 @@ class StatsBucket(BaseModel):
     wasted: float = Field(description="Of that spend, what was thrown away")
     spent_and_used: float = Field(description="spent - wasted; the green part of the bar")
     rescued: float = Field(description="Value used up while already in the red")
+    rescued_solo: float = Field(
+        default=0.0, description="Of `rescued`, what was eaten alone"
+    )
+    rescued_friends: float = Field(
+        default=0.0, description="Of `rescued`, what was eaten at a feast. "
+                                 "`rescued_solo` + `rescued_friends` == `rescued`.",
+    )
     items_wasted: int
     items_rescued: int
+    items_rescued_solo: int = Field(default=0)
+    items_rescued_friends: int = Field(
+        default=0,
+        description="`items_rescued_solo` + `items_rescued_friends` == `items_rescued`",
+    )
 
 
 class StatsRead(BaseModel):
@@ -279,6 +323,19 @@ class StatsRead(BaseModel):
     spent: float
     wasted: float
     rescued: float
+    rescued_solo: float = Field(
+        default=0.0, description="Of `rescued`, what was eaten alone"
+    )
+    rescued_friends: float = Field(
+        default=0.0, description="Of `rescued`, what was eaten at a feast. "
+                                 "`rescued_solo` + `rescued_friends` == `rescued`.",
+    )
+    items_rescued: int = Field(default=0, description="Rescued items across every bucket")
+    items_rescued_solo: int = Field(default=0)
+    items_rescued_friends: int = Field(
+        default=0,
+        description="`items_rescued_solo` + `items_rescued_friends` == `items_rescued`",
+    )
     waste_percent_first: float = Field(
         description="Waste as a share of spending in the earliest bucket"
     )
@@ -510,6 +567,10 @@ class FeastRead(BaseModel):
     name: str
     host_id: int
     host_name: str
+    status: FeastStatus = FeastStatus.planned
+    outcome_at: Optional[datetime] = Field(
+        default=None, description="When the host recorded the outcome"
+    )
     scheduled_for: Optional[datetime]
     recipe: dict
     attendees: list[AttendeeRead]
@@ -526,6 +587,46 @@ class FeastRead(BaseModel):
 
 class InviteResponseUpdate(BaseModel):
     response: InviteResponse
+
+
+class FeastOutcomeUpdate(BaseModel):
+    """The host recording how a feast turned out. Host only."""
+
+    host_id: int = Field(description="Must be the feast's host")
+    status: FeastStatus = Field(
+        description="`rescued` (it happened) or `failed` (it fell through). "
+                    "`planned` is the starting state and cannot be set back."
+    )
+    item_ids: Optional[list[int]] = Field(
+        default=None, max_length=100,
+        description="Which groceries got eaten. Only meaningful with `rescued`. "
+                    "Omitted, the recipe snapshot is matched against attendees' "
+                    "shelves. Items belonging to non-attendees are ignored.",
+    )
+
+    @model_validator(mode="after")
+    def not_back_to_planned(self):
+        if self.status == FeastStatus.planned:
+            raise ValueError("A feast cannot be set back to `planned`")
+        return self
+
+
+class FeastOutcomeResult(BaseModel):
+    """What recording the outcome did.
+
+    Carries **no prices**: an attendee may act on a feast containing other
+    people's groceries, and what those cost is nobody else's business.
+    """
+
+    feast: "FeastRead"
+    items_used: int = Field(description="Items marked eaten and attributed to this feast")
+    items_rescued: int = Field(
+        description="Of those, how many were already in the red and so count as rescues"
+    )
+    item_ids: list[int] = Field(description="The items that were resolved")
+    owners: list[str] = Field(
+        description="Display names of the attendees who contributed them"
+    )
 
 
 class NotificationRead(BaseModel):
