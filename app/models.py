@@ -127,6 +127,7 @@ class User(SQLModel, table=True):
     # verify_password() treats that as "can never log in" rather than "no check".
     password_hash: Optional[str] = Field(default=None, max_length=255)
     buddy: Buddy = Field(default=Buddy.sammy)
+    expo_push_token: Optional[str] = Field(default=None, max_length=255)
 
     # A photo the user points us at. There is no object storage wired up here,
     # so the service stores the link and never the bytes.

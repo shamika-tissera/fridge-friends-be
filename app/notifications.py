@@ -43,7 +43,47 @@ class NullChannel:
         return None
 
 
-CHANNELS = {"log": LogChannel, "null": NullChannel}
+class ExpoChannel:
+    """Delivers via Expo Push Notifications."""
+
+    name = "expo"
+
+    def send(self, *, to: User, title: str, body: str) -> None:
+        from exponent_server_sdk import (
+            DeviceNotRegisteredError,
+            PushClient,
+            PushMessage,
+            PushServerError,
+            PushTicketError,
+        )
+        import requests
+
+        if not to.expo_push_token:
+            return None
+
+        try:
+            response = PushClient().publish(
+                PushMessage(
+                    to=to.expo_push_token,
+                    title=title,
+                    body=body,
+                    data={"url": "/(tabs)/meals"},
+                )
+            )
+        except PushServerError as exc:
+            raise DeliveryFailed(f"PushServerError: {exc.errors}")
+        except (requests.exceptions.ConnectionError, requests.exceptions.HTTPError) as exc:
+            raise DeliveryFailed(f"ConnectionError: {exc}")
+
+        try:
+            response.validate_response()
+        except DeviceNotRegisteredError:
+            raise DeliveryFailed("DeviceNotRegisteredError")
+        except PushTicketError as exc:
+            raise DeliveryFailed(f"PushTicketError: {exc.push_response.dict()}")
+
+
+CHANNELS = {"log": LogChannel, "null": NullChannel, "expo": ExpoChannel}
 
 
 def get_channel():

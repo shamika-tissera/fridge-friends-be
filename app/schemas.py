@@ -642,3 +642,8 @@ class NotificationRead(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class PushTokenCreate(BaseModel):
+    expo_push_token: str
+

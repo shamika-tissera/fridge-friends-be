@@ -6,6 +6,7 @@ from app.database import get_session
 from app.models import User
 from app.schemas import (
     PasswordUpdate,
+    PushTokenCreate,
     TasteProfileRead,
     TasteProfileUpdate,
     UserCreate,
@@ -156,3 +157,13 @@ def delete_user(user_id: int, session: Session = Depends(get_session)):
     user = get_user_or_404(user_id, session)
     session.delete(user)
     session.commit()
+
+@router.post("/{user_id}/push-token", status_code=status.HTTP_204_NO_CONTENT)
+def register_push_token(
+    user_id: int, payload: PushTokenCreate, session: Session = Depends(get_session)
+):
+    user = get_user_or_404(user_id, session)
+    user.expo_push_token = payload.expo_push_token
+    session.add(user)
+    session.commit()
+
