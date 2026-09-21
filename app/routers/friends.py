@@ -28,7 +28,7 @@ def find_friendship(session: Session, a: int, b: int) -> Friend | None:
     ).first()
 
 
-@router.post("", response_model=FriendRead, status_code=status.HTTP_201_CREATED)
+@router.post("", response_model=FriendWithUser, status_code=status.HTTP_201_CREATED)
 def add_friend(
     user_id: int, payload: FriendCreate, session: Session = Depends(get_session)
 ):
@@ -45,10 +45,14 @@ def add_friend(
     session.add(friendship)
     session.commit()
     session.refresh(friendship)
-    return friendship
+    return FriendWithUser(
+        **friendship.model_dump(),
+        friend=session.get(User, payload.friend_id),
+        needs_rescue=0,
+    )
 
 
-@router.post("/invite", response_model=FriendRead, status_code=status.HTTP_201_CREATED)
+@router.post("/invite", response_model=FriendWithUser, status_code=status.HTTP_201_CREATED)
 def invite_by_username(
     user_id: int, payload: FriendInvite, session: Session = Depends(get_session)
 ):
