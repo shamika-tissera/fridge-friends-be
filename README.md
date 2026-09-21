@@ -1,697 +1,306 @@
-# Grocery Tracker API
+# Fridge Friends API
 
-FastAPI + SQLModel service for tracking groceries, sharing with friends, and
-catching items before they expire.
+The backend for Fridge Friends, an app for keeping track of what is in your kitchen, using it before it goes off, and cooking with friends when there is too much to eat alone.
 
-## Run
+You add groceries and the server works out how long each one will last. Anything close to its date shows up on your shelf as something to use up. Friends can see each other's soon-to-expire food and plan a shared meal around it, called a feast. The app also tracks what you spent, what you wasted, and what you saved by cooking things in time.
+
+## Stack
+
+- FastAPI and Pydantic v2
+- SQLModel (SQLAlchemy underneath) with Alembic migrations
+- Postgres in production, developed against Supabase. SQLite when no `DATABASE_URL` is set
+- Any OpenAI-compatible LLM endpoint for ingredient lookups and recipe suggestions
+- Expo push notifications for feast invitations, plus an in-app inbox
+
+## Getting started
+
+You need Python 3.11 or newer.
 
 ```bash
+git clone https://github.com/shamika-tissera/fridge-friends-be.git
+cd fridge-friends-be
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements-dev.txt
-cp .env.example .env      # then paste your DATABASE_URL in
-alembic upgrade head      # create/update the schema
-python -m scripts.seed    # optional: demo data
+alembic upgrade head
+python -m scripts.seed
 uvicorn app.main:app --reload
 ```
 
-Docs at http://localhost:8000/docs.
+With no configuration this runs against a local SQLite file, `grocery.db`. The API is at http://localhost:8000 and the interactive docs are at http://localhost:8000/docs. The seed step is optional and is described under [Demo data](#demo-data). `requirements.txt` holds only the runtime dependencies, in case you do not want pytest.
 
-`DATABASE_URL` is read from `.env` (gitignored). It accepts the connection
-string Supabase gives you verbatim — a bare `postgresql://` URL is rewritten to
-use psycopg 3, and SSL is required by default (`DATABASE_SSLMODE` to change).
-With no `DATABASE_URL` set it falls back to local `sqlite:///./grocery.db`, so
-the app still runs offline.
+### Configuration
+
+Settings are environment variables. For local work, copy `.env.example` to `.env` and edit it. A real environment variable always wins over the file.
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `DATABASE_URL` | `sqlite:///./grocery.db` | Postgres or SQLite. A bare `postgresql://` or `postgres://` URL, which is what Supabase gives you, is switched to psycopg 3 automatically. |
+| `DATABASE_SSLMODE` | `require` | Postgres only. |
+| `LLM_API_KEY` | none | Needed for ingredient lookups and recipe suggestions. |
+| `LLM_BASE_URL` | `https://integrate.api.nvidia.com/v1` | Any OpenAI-compatible endpoint. |
+| `LLM_MODEL` | `openai/gpt-oss-20b` | Whatever your endpoint serves. |
+| `LLM_TIMEOUT_SECONDS` | `90` | How long to wait on the LLM before giving up. |
+| `NOTIFICATION_CHANNEL` | `log` | `log`, `null` or `expo`. See [Notifications](#notifications). |
+| `CORS_ORIGINS` | `*` | Comma-separated list of allowed origins. |
+
+`.env.example` ships with a placeholder `DATABASE_URL`. Fill it in with a real Postgres string, or delete the line to stay on SQLite.
+
+Only two features call the LLM: the ingredient lookup after onboarding and `POST /recipes/suggest`. Without a key, recipe suggestions return 503 and the lookup marks its rows `failed`. Everything else works. To check that your endpoint answers, run this (it takes an optional model name):
 
 ```bash
-pytest     # always runs on in-memory sqlite, never touches your real DB
+python -m scripts.check_llm
 ```
 
-## Data model
+### Deploying
 
-| Entity | Notes |
-| --- | --- |
-| `User` | `id`, unique `username` (the "User ID"), `password_hash`, `buddy`, optional unique `email`, `name`, plus the taste profile (`diets`, `avoid_allergens`, `favorite_cuisines`) — table is `app_user`, since `user` is reserved in Postgres |
-| `GroceryItem` | belongs to one user; `expires_on`, `quantity`/`unit`, `category`, `price`, the shelf fields `shelf_life_days`, `spoilage_profile`, `shelf_buddy`, and how it ended: `consumed`, `outcome`, `resolved_on`, `rescued` |
-| `Friend` | association entity between two users: `user_id`, `friend_id`, `status` (`pending`/`accepted`/`blocked`) |
-| `Feast` | a planned meal: `name`, host, optional `scheduled_for`, a **snapshot** of the chosen recipe (JSONB), and its `status` (`planned`/`rescued`/`failed`) with `outcome_at` |
-| `FeastAttendee` | association entity: one person invited to one feast, with their `response` (`invited`/`accepted`/`declined`) |
-| `Notification` | a user's in-app message, with `delivery_status` for the outbound channel |
-| `FoodPreference` | a food the user likes **or dislikes** + its LLM-generated `ingredients` (JSONB), with `preference`, `cuisine` and an `ingredient_status` |
-
-A friendship pair is stored **once**, in whichever direction it was requested;
-`status` is what makes it mutual. Deleting a user cascades to their items and
-friendships.
-
-## Endpoints
-
-**Expiry (the main one)**
-
-- `GET /users/{user_id}/grocery-items/expiring` — one user's soon-to-expire items
-- `GET /grocery-items/expiring` — same across all users, or scoped with `?user_id=`
-
-Query params (both): `within_days` (default `3`), `include_friends` (pull in
-accepted friends' items), `include_expired` (default `true`), `include_consumed`
-(default `false`). Results are sorted soonest-first and each carries
-`days_until_expiry`, `expired`, and `owner_name`. Items with no `expires_on`
-are never returned.
+Install `requirements.txt`, set `DATABASE_URL`, `CORS_ORIGINS` and the LLM variables in the environment, run `alembic upgrade head`, and start the server:
 
 ```bash
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+Read [Security and known limitations](#security-and-known-limitations) before putting it on a public address.
+
+## Trying it out
+
+These commands use the demo data and assume a fresh database, so Sam Perera is user 1.
+
+```bash
+# log in (returns the user record, there is no token)
+curl -X POST localhost:8000/auth/login -H 'content-type: application/json' \
+     -d '{"username": "sam.perera", "password": "fridge-friends-demo"}'
+
+# the home screen: every item with its freshness chip, plus the counts above them
+curl localhost:8000/users/1/shelf
+
+# what is about to expire, including friends' items
 curl "localhost:8000/users/1/grocery-items/expiring?within_days=5&include_friends=true"
-```
 
-**Accounts** — `POST /auth/signup` (same handler as `POST /users`),
-`POST /auth/login`, `PUT /users/{id}/password`
-
-**Users** — `GET /users` (`?username=` for an exact User ID lookup),
-`GET|PATCH|DELETE /users/{id}`, `GET|PUT /users/{id}/taste-profile`
-
-**Shelf** — `GET /users/{id}/shelf`,
-`GET /grocery-items/freshness-preview?name=`,
-`POST /grocery-items/{id}/resolve` (used/wasted)
-
-**Waste and spending** — `GET /users/{id}/stats?period=weeks|months&buckets=6`
-
-**Grocery items** — `POST|GET /users/{user_id}/grocery-items` (list filters:
-`category`, `consumed`, `expires_before`), `GET|PATCH|DELETE /grocery-items/{id}`
-
-**Friends** — `POST /users/{user_id}/friends` (request by id),
-`POST /users/{user_id}/friends/invite` (request by User ID),
-`GET /users/{user_id}/friends?status=accepted`,
-`GET /users/{user_id}/friends/{friend_id}/shelf` (their yellow/red buddies, no prices),
-`PATCH /users/{user_id}/friends/{friend_id}` (accept/block),
-`DELETE /users/{user_id}/friends/{friend_id}`
-
-## Accounts
-
-The join screen collects a User ID, a password and a buddy — no email:
-
-```bash
-curl -X POST localhost:8000/auth/signup -H 'content-type: application/json' \
-     -d '{"username": "pantry.pal", "password": "cold-storage-9", "buddy": "carl"}'
-```
-
-`username` is the login handle and how friends find each other. It is stored
-lowercased, must be 3-40 characters of letters, digits, dot, dash or
-underscore, and is unique. `email` is still accepted and still unique, but it
-is optional: nothing on the screen asks for one, and the in-app inbox does not
-need it. `name` defaults to the User ID until the profile screen sets one.
-`buddy` is one of `sammy`, `milo`, `eddie`, `carl`, `bella`.
-
-Passwords are stored as PBKDF2-HMAC-SHA256 (240k iterations, per-password
-salt, stdlib only — no native build step) and never come back out of the API.
-`POST /auth/login` checks them and returns the user. A wrong password and an
-unknown User ID give the same 401, so accounts cannot be enumerated.
-
-**There are still no session tokens.** Login verifies credentials and hands
-back the user; every other endpoint takes `user_id` in the path, unauthenticated.
-Issuing a token is a change to `app/routers/auth.py` plus a dependency on the
-other routers — the stored credentials are already in the right shape for it.
-
-## Taste profile
-
-The second onboarding screen — diets, allergens and loved cuisines:
-
-```bash
-curl -X PUT localhost:8000/users/1/taste-profile -H 'content-type: application/json' \
-     -d '{"diets": ["Pescatarian"], "avoid_allergens": ["Peanuts"],
-          "favorite_cuisines": ["Italian", "Mexican"]}'
-```
-
-The labels the UI shows are accepted as-is (`"Gluten-free"` → `gluten_free`,
-`"Tree nuts"` → `tree_nuts`). Diets are `vegetarian`, `vegan`, `pescatarian`,
-`gluten_free`, `dairy_free`; allergens are `peanuts`, `shellfish`, `tree_nuts`,
-`sesame`. Cuisines are free text, title-cased and de-duplicated.
-
-Each list **replaces** the previous one rather than merging — de-selecting the
-last chip has to stick. Omit a field to leave it alone.
-
-All three live on `app_user` as JSON columns: short fixed lists, always read
-with the user, never queried on their own. Three join tables would buy nothing.
-
-**Allergens are enforced, not merely suggested** — see
-[Recipe suggestions](#recipe-suggestions).
-
-## The shelf
-
-`GET /users/{id}/shelf` is the home screen in one call: every unconsumed item
-with its freshness chip, plus the counts printed above them.
-
-```json
-{ "user_id": 1, "fresh": 3, "use_soon": 1, "use_now": 2, "expired": 1,
-  "needs_rescue": 3, "rescue_value": 6.99,
-  "items": [ { "name": "Spinach", "price": 3.49, "expires_on": "2026-09-26",
-               "shelf_life_days": 7, "spoilage_profile": "gradual",
-               "shelf_buddy": "leaf", "days_until_expiry": 2,
-               "freshness": "use_now", "freshness_label": "2 days" } ] }
-```
-
-`days_until_expiry`, `freshness` and `freshness_label` are **derived on read**,
-never stored — they are a function of today's date, so a stored copy is wrong
-by morning. The bands: `use_now` ≤ 2 days, `use_soon` ≤ 5 days, `fresh` beyond
-that, `expired` past the date, `unknown` when no date is recorded.
-`needs_rescue` is `use_now + expired`, and `rescue_value` totals their prices.
-
-### Adding an ingredient
-
-Only `name` is required. Everything else the add sheet shows is filled in:
-
-```bash
+# add an ingredient (only the name is required)
 curl -X POST localhost:8000/users/1/grocery-items -H 'content-type: application/json' \
      -d '{"name": "Spinach", "price": 3.49}'
-```
 
-- `purchased_on` defaults to today — the freshness timer starts when it was
-  bought, not when it was typed in. Back-date it and the expiry moves with it.
-- `shelf_life_days`, `spoilage_profile` (`gradual`/`sudden`/`stable`),
-  `shelf_buddy` and `category` come from the catalogue in `app/freshness.py`.
-- `expires_on` is `purchased_on + shelf_life_days`. An explicit `expires_on`
-  always wins — a date read off the packet beats anything inferred from a name.
-  Send `"expires_on": null` for something with no timer at all (salt, sugar).
+# bin the expired baby spinach that came with the seed data
+curl -X POST localhost:8000/grocery-items/2/resolve -H 'content-type: application/json' \
+     -d '{"outcome": "wasted"}'
 
-`GET /grocery-items/freshness-preview?name=Spinach` returns exactly what saving
-would store, so the sheet can show it while the user is still typing:
-
-```json
-{ "name": "Spinach", "shelf_life_days": 7, "spoilage_profile": "gradual",
-  "shelf_buddy": "leaf", "category": "produce", "expires_on": "2026-09-27",
-  "summary": "Gradual · ~7 days" }
-```
-
-**Why a static catalogue and not the LLM.** The preview has to answer on every
-keystroke; a round-trip there would be slow, billed, and would not give the
-same answer twice. The answer for "spinach" does not change. Anything not in
-the catalogue falls back to 7 days / `gradual` / `leaf` — deliberately short,
-since over-estimating shelf life is how food quietly rots.
-
-The values are copied onto the row at write time rather than re-derived on
-read: editing the catalogue later must not silently move an existing item's
-expiry date. `shelf_buddy` is one of the keys in `freshness.BUDDY_KEYS`, which
-a test pins so the catalogue cannot invent a sprite the front end has no art for.
-
-## Onboarding & ingredients
-
-The onboarding screen sends both lists in one call:
-
-```bash
-curl -X POST localhost:8000/users/1/food-preferences \
-     -H 'content-type: application/json' \
-     -d '{"likes": ["Pad Thai", "Jollof Rice"], "dislikes": ["Durian"]}'
-```
-
-Either list may be empty, but not both. Likes and dislikes share one table:
-they hold identical data and are nearly always read together ("suggest
-something they like, avoiding anything containing an ingredient they don't").
-The unique constraint is on `(user_id, name)` and ignores `preference`, so a
-user cannot both like and dislike the same food — if one confirmation contains
-both, the first mention wins and the other comes back in `skipped`.
-
-**Ingredients are fetched for dislikes too.** That is the point of storing
-them: a dish gets ruled out by what is *in* it, not just by its name.
-
-```sql
--- everything this user wants to avoid, derived from their dislikes
-select distinct i->>'name'
-from food_preference f
-cross join lateral jsonb_array_elements(f.ingredients) i
-where f.user_id = 1 and f.preference = 'dislike'
-  and (i->>'essential')::boolean;
-```
-
-It returns **202** immediately with each food `pending`. The ingredient lookup
-runs in the background and the client polls `GET /users/1/food-preferences`
-until `ingredient_status` becomes `ready`:
-
-```json
-{ "name": "Pad Thai", "preference": "like", "cuisine": "Thai", "ingredient_status": "ready",
-  "ingredients": [{"name": "rice noodles", "category": "grain", "essential": true}] }
-```
-
-Endpoints: `POST|GET /users/{id}/food-preferences` (filter with
-`?preference=like` or `?preference=dislike`),
-`POST /users/{id}/food-preferences/{id}/refresh-ingredients` (retry a `failed`
-row), `DELETE /users/{id}/food-preferences/{id}`.
-
-**Why the lookup is not inline.** These models can take a minute or more, and
-an onboarding request that blocks that long times out at proxies and load
-balancers. So the picks are committed first and enriched after: a failed
-lookup leaves the row `failed` with the reason in `ingredient_error`, and the
-user never has to choose their food twice. `ingredient_status` is the contract:
-
-| status | meaning |
-| --- | --- |
-| `pending` | saved; lookup queued or running |
-| `ready` | `ingredients` populated |
-| `failed` | lookup failed or the model did not recognise the dish — call the refresh endpoint |
-
-The model's reply is parsed and validated against a Pydantic schema
-(`app/llm.py`) before it is stored, so malformed or hallucinated shapes become
-a `failed` row rather than junk in the database. `ingredients` is a JSONB
-column on Postgres, so it is directly queryable:
-
-```sql
-select name from food_preference where ingredients @> '[{"name":"rice noodles"}]';
-```
-
-Check the endpoint from your own network:
-
-```bash
-python -m scripts.check_llm                   # the configured LLM_MODEL
-python -m scripts.check_llm some/other-model  # try a different one
-```
-
-## The You screen
-
-### Account
-
-`PATCH /users/{id}` changes the User ID (and name, buddy, email);
-`PUT /users/{id}/password` changes the password. Both report a taken User ID as
-a 409 naming *which* field clashed, since email and User ID are both unique and
-only one of them is on the screen.
-
-Changing a User ID is safe: it is a display handle, not the row key, so
-friendships, items and feasts all point at `id` and nothing moves with it.
-
-### Friends
-
-The invite box collects a handle, not an internal id:
-
-```bash
-curl -X POST localhost:8000/users/1/friends/invite \
-     -H 'content-type: application/json' -d '{"username": "maya.cooks"}'
-```
-
-`GET /users/{id}/friends` carries `needs_rescue` per row — the "2 buddies need
-rescuing" line — counted for every friend in **one** query rather than one per
-row.
-
-`GET /users/{id}/friends/{friend_id}/shelf` is what a friend may see:
-
-- **Only the yellow and red buddies.** A friend is being shown what needs
-  cooking, not an inventory of someone's fridge.
-- **Never a price.** The screen promises "prices stay private", so the response
-  model (`FriendShelfItem`) has no price field at all — the promise cannot be
-  broken by forgetting to strip one.
-- **Accepted friendships only.** Pending or blocked is a 403, not a peek.
-
-### Waste and spending
-
-```bash
+# spending, waste and rescues over the last six weeks
 curl "localhost:8000/users/1/stats?period=weeks&buckets=6"
 ```
 
-```json
-{ "spent": 312.00, "wasted": 26.90, "rescued": 39.85,
-  "buckets": [ {"label": "W1", "starts_on": "2026-08-10", "ends_on": "2026-08-16",
-                "spent": 48.00, "wasted": 8.16, "spent_and_used": 39.84,
-                "rescued": 3.25, "items_wasted": 1, "items_rescued": 1} ],
-  "waste_percent_first": 17.0, "waste_percent_last": 2.1,
-  "summary": "Waste is down from 17% of spending to 2.1% over 6 weeks.",
-  "priced_items": 64, "unpriced_items": 0 }
-```
+## API
 
-`spent_and_used` and `wasted` are the two parts of each stacked bar, and sum to
-`spent`. Weeks run Monday-Sunday with the current week last; months are
-calendar months.
+Every route, with its parameters and response shapes, is in the interactive docs at `/docs` (Swagger UI) or `/redoc`. The raw schema is at `/openapi.json`, and `GET /health` returns `{"status": "ok"}` for uptime checks.
 
-**Spending is attributed to when something was bought, waste and rescues to
-when they were resolved.** An item bought in W1 and binned in W3 is W1's
-spending and W3's waste — which is how anyone reading the chart would expect it
-to behave. (`spent_and_used` is clamped at zero, since a bar can contain waste
-from something bought before the window.)
+Most routes are scoped to a user through the path, as in `/users/{user_id}/...`. Errors use FastAPI's `{"detail": "..."}` body. You will see 404 for a missing record, 409 for a User ID or email that is taken (the message says which), 422 for validation failures, 403 for things a user is not allowed to see or do, and 503 when the LLM cannot be reached.
 
-**Items with no price are reported, not treated as free.** They come back in
-`unpriced_items` rather than quietly dragging every total down.
+### Accounts and profile
 
-**The trend compares the earliest bucket that has spending in it**, not
-literally the first bar. A month from before the user joined is 0% waste only
-because it is empty, and "waste is up from 0%" is a misreading of an empty bar.
-With fewer than two such buckets there is no trend to report and `summary` says
-so instead of inventing one.
-
-
-### Solo vs friends rescues
-
-`rescued` splits by where the food was eaten. Pass `feast_id` when resolving:
-
-```bash
-curl -X POST localhost:8000/grocery-items/12/resolve \
-     -H 'content-type: application/json' \
-     -d '{"outcome": "used", "feast_id": 4}'
-```
-
-Every bucket and the top-level totals carry the split:
-
-| field | meaning |
+| Route | Purpose |
 | --- | --- |
-| `rescued_solo` / `rescued_friends` | money, and they sum to `rescued` |
-| `items_rescued_solo` / `items_rescued_friends` | counts, and they sum to `items_rescued` |
+| `POST /auth/signup` | Create an account from a User ID, a password and a buddy. Email is optional. Same handler as `POST /users`. |
+| `POST /auth/login` | Check credentials and return the user. A wrong password and an unknown User ID give the same 401. |
+| `GET /users` | List users. `?username=` looks up one User ID exactly. |
+| `GET`, `PATCH`, `DELETE /users/{id}` | Read, edit (User ID, name, buddy, email, avatar link) or delete. Deleting removes the user's items, friendships, food preferences, notifications and hosted feasts. |
+| `PUT /users/{id}/password` | Change the password. Needs the current one. |
+| `GET`, `PUT /users/{id}/taste-profile` | Diets, allergens and favourite cuisines. Each list you send replaces the old one. |
+| `POST /users/{id}/push-token` | Store the device's Expo push token. |
 
-A missing `feast_id` means solo — which is also what every rescue recorded
-before feasts were tracked was, so old rows need no backfill and read
-correctly.
+The User ID is the login handle and how friends find each other. It is stored lowercase and must be 3 to 40 characters of letters, digits, dots, dashes or underscores, starting with a letter or digit. The buddy is one of `sammy`, `milo`, `eddie`, `carl` or `bella`. Passwords need at least 8 characters.
 
-`feast_id` is checked: the feast must exist (404) and the item's owner must
-actually be going to it (422). Without that, any id at all would land in
-`rescued_friends` and the split would be whatever a client felt like claiming.
+### Groceries and shelf
 
-Attribution is stored for any outcome, not just rescues — food binned after a
-feast is still food that feast is answerable for — but only rescues are ever
-split by it.
-
-### Why `outcome` exists
-
-`consumed` was a single flag: gone. The whole point of this screen is the
-difference between *eaten* and *binned*, which that flag cannot express. So an
-item now ends its life through:
-
-```bash
-curl -X POST localhost:8000/grocery-items/12/resolve \
-     -H 'content-type: application/json' -d '{"outcome": "wasted"}'
-```
-
-| field | meaning |
+| Route | Purpose |
 | --- | --- |
-| `outcome` | `on_shelf`, `used` (eaten) or `wasted` (binned) |
-| `resolved_on` | when it left the shelf — defaults to today |
-| `rescued` | it was *used* while already in the use-now or expired band |
-| `rescued_feast_id` | the feast that ate it; **null means solo** |
+| `POST /users/{id}/grocery-items` | Add an item. Only `name` is required. |
+| `GET /users/{id}/grocery-items` | List items. Filters: `category`, `consumed`, `expires_before`, plus `offset` and `limit`. |
+| `GET`, `PATCH`, `DELETE /grocery-items/{id}` | Read, edit or delete one item. |
+| `POST /grocery-items/{id}/resolve` | Mark an item `used` or `wasted`. Pass `feast_id` if it was eaten at a feast. |
+| `GET /grocery-items/freshness-preview?name=` | The shelf life the server would assign to a name. No database or LLM call. |
+| `GET /users/{id}/shelf` | The home screen: all items with freshness chips and rescue counts. |
+| `GET /users/{id}/stats` | Spending, waste and rescues by week or month. |
+| `GET /users/{id}/grocery-items/expiring` | Items close to their date. Options: `within_days` (default 3), `include_friends`, `include_expired` (default true), `include_consumed` (default false). |
+| `GET /grocery-items/expiring` | The same across all users, or one user with `?user_id=`. |
 
-`rescued` is decided at the moment of the change, not derived later: once an
-item is off the shelf, its expiry date no longer says how close a call it was.
+### Friends
 
-This is also why the shelf resolves items instead of deleting them — **a
-deleted row cannot be counted as waste**, and the chart would flatter the user
-every time they tidied up.
-
-`consumed` is kept and moved in step, so existing callers keep working:
-`PATCH {"consumed": true}` records `used`, and setting it back to false clears
-the outcome and puts the item back on the shelf.
-
-## Recipe suggestions
-
-What could these people cook together, right now?
-
-```bash
-curl -X POST localhost:8000/recipes/suggest \
-     -H 'content-type: application/json' \
-     -d '{"user_ids": [1, 2], "max_results": 4}'
-```
-
-It pools everyone's pantry, pools their food preferences, and asks the LLM for
-recipes. Each suggestion comes back as:
-
-```json
-{ "rank": 1,
-  "rank_reason": "Uses expiring: Greek yogurt, Chicken thighs, Rocket",
-  "name": "Greek Yogurt Chicken Wrap",
-  "cuisine": "Mediterranean",
-  "prep_minutes": 10, "cook_minutes": 10, "total_minutes": 20,
-  "uses": [ {"name": "Greek yogurt",  "from_users": ["Sam Perera"],  "expiring": true},
-            {"name": "Spring onions", "from_users": ["Mei Tanaka"],  "expiring": true} ],
-  "missing": ["pancetta"],
-  "contributors": ["Sam Perera", "Mei Tanaka"],
-  "liked_by": [], "is_liked": false }
-```
-
-**Who brings what.** Every entry in `uses` names the users who actually have
-that item, and `contributors` is the set of users supplying at least one
-ingredient. Both are read from `grocery_item` — the model is never asked who
-owns anything. One ingredient held by two people collapses to a single entry
-listing both (matched on a normalised name, so "Rice" and " rice " are one
-thing).
-
-**How long it takes.** `prep_minutes` and `cook_minutes` come from the model;
-`total_minutes` is their sum, and is `null` unless both are known. A time that
-is missing, non-numeric, or absurd (over 8 hours) becomes `null` rather than
-being shown or used for ranking.
-
-**Ranking.** `rank` is 1-based and reflects the server's own ordering;
-`rank_reason` names the rule that earned the position. The keys, in order:
-
-1. Dishes someone likes (`"Liked by Ann"`)
-2. Then dishes using the most about-to-expire ingredients (`"Uses expiring: spinach"`)
-3. Then the quickest by `total_minutes` (`"Cookable in 12 min"`)
-
-Speed is only a tiebreak — a liked dish outranks a faster one.
-
-The rules, and where each is enforced:
-
-| Rule | Enforced |
+| Route | Purpose |
 | --- | --- |
-| Never suggest anything containing a group allergen | **In code**, after the model replies |
-| Never suggest a dish breaking a group diet | **In code**, after the model replies |
-| Never suggest a dish anyone in the group dislikes | **In code**, after the model replies |
-| Rank liked dishes first | In code (`is_liked` is matched against the DB, not claimed by the model) |
-| Fall back to other dishes when no liked one is cookable | In code — `detail` says so |
-| Prefer ingredients that are about to expire | Prompt, then re-ranked in code |
-| Who owns each ingredient | In code, from `grocery_item` |
+| `POST /users/{id}/friends` | Send a friend request by user id. |
+| `POST /users/{id}/friends/invite` | Send a request by User ID, the handle a person types into the invite box. |
+| `GET /users/{id}/friends` | List friendships, filtered with `?status=`. Each row has the other user and how many of their items need rescuing. |
+| `GET /users/{id}/friends/{friend_id}/shelf` | A friend's yellow and red items. No prices. Accepted friends only, otherwise 403. |
+| `PATCH /users/{id}/friends/{friend_id}` | Accept or block. |
+| `DELETE /users/{id}/friends/{friend_id}` | Remove the friendship. |
 
-**The model is instructed, but not trusted.** It is told the rules in the
-prompt, and every rule that matters is applied again server-side — a prompt is
-guidance, not a guarantee. Four things are recomputed rather than believed: `is_liked` (matched against
-`food_preference`), `uses` (resolved against the real pantry, so anything
-invented is dropped and real owners are attached), `uses_expiring` — in testing
-the model cheerfully labelled 300-day-old lentils as expiring, and that field
-drives the ranking — and the ordering itself.
+A friendship is stored once, in whichever direction it was requested, and `status` (`pending`, `accepted` or `blocked`) is what makes it mutual.
 
-Expired and consumed groceries are excluded from the pantry: a recipe built on
-food that has already gone off is worse than no suggestion.
+### Food preferences
 
-### Allergies and diets
+| Route | Purpose |
+| --- | --- |
+| `POST /users/{id}/food-preferences` | Save liked and disliked foods. Returns 202 and looks up ingredients in the background. |
+| `GET /users/{id}/food-preferences` | List them. Poll until `ingredient_status` is `ready`. `?preference=like` or `dislike` filters. |
+| `POST /users/{id}/food-preferences/{food_id}/refresh-ingredients` | Retry a lookup that `failed`. |
+| `DELETE /users/{id}/food-preferences/{food_id}` | Remove one. |
 
-The onboarding screen promises allergens "never show up in your recipes, or in
-Feast recipes with friends", so they are checked twice: the prompt is told, and
-every suggestion is then matched against the keyword lists in `app/dietary.py`
-before it reaches the client. A hit drops the suggestion outright — the
-response reports `excluded_for_dietary_rules` and, if nothing survives, says so
-in `detail`. The check covers the dish name, what it uses *and* what is still
-to buy: tahini in the shopping list is still sesame.
+### Recipes and feasts
 
-Constraints are pooled across everyone eating and every one of them applies:
-one person's peanut allergy rules peanuts out of the shared meal, and the
-strictest diet in the group is the one the meal has to satisfy.
+| Route | Purpose |
+| --- | --- |
+| `POST /recipes/suggest` | Recipes cookable from the pooled pantries of one or more users. |
+| `POST /feasts` | Create a feast from a suggestion and invite people. |
+| `GET /feasts/{id}` | One feast, with attendees and delivery counts. |
+| `GET /users/{id}/feasts` | Feasts a user hosts or is invited to. `?hosting_only=true` narrows it to hosting. |
+| `POST /feasts/{id}/respond/{user_id}` | Accept or decline an invitation. |
+| `POST /feasts/{id}/outcome` | The host records `rescued` or `failed`. |
+| `POST /feasts/{id}/resend-invitations` | Retry any invitation that has not been delivered. |
+| `GET /users/{id}/notifications` | The in-app inbox, newest first. `?unread_only=true` filters. |
+| `POST /notifications/{id}/read` | Mark one notification as read. |
 
-`POST /feasts` re-runs the same check against the actual guest list, because
-the suggestion was filtered for whoever it was generated for — which may be a
-different set, or the same one after somebody added an allergy. A clash is a
-422 naming the offending ingredient rather than a feast nobody can eat.
+## How it works
 
-Favourite cuisines are the soft counterpart: they go into the prompt as a
-preference and never exclude anything.
+### Freshness and the shelf
 
-**A dislike outranks a like.** If one person likes a dish and another dislikes
-it, it is excluded — the meal is shared.
+When you add an item, only `name` is required. The server fills in the rest from a static catalogue in `app/freshness.py`: shelf life in days, a spoilage profile (`gradual`, `sudden` or `stable`), the buddy sprite drawn on the shelf, and a category. `purchased_on` defaults to today, and `expires_on` is `purchased_on` plus the shelf life. If you send your own `expires_on`, it wins over anything guessed from the name. Send `"expires_on": null` for something that never goes off, like salt.
 
-Note that dislikes are matched by *dish*, not by ingredient. Ingredient-level
-avoidance sounds better but is a trap: Sam dislikes "Liver and Onions", whose
-essential ingredients include onions, so avoiding every disliked ingredient
-would rule out most of the cookbook.
+The catalogue is static on purpose. The add screen calls `freshness-preview` on every keystroke, and an LLM round trip there would be slow, cost money and give a different answer on a different day. Names the catalogue does not know get 7 days, `gradual`. That errs short, because a shelf life guessed too long is how food rots unnoticed. The values are copied onto the row when it is saved, so editing the catalogue later does not move the expiry date of anything already on a shelf.
 
-## Feasts
+Freshness is worked out each time an item is read and never stored, since it depends on today's date. The bands are:
 
-The front end posts back whichever suggestion the user picked:
+- `use_now`: 2 days or fewer left
+- `use_soon`: 5 days or fewer
+- `fresh`: more than 5 days
+- `expired`: past its date
+- `unknown`: no date recorded
 
-```bash
-curl -X POST localhost:8000/feasts -H 'content-type: application/json' -d '{
-  "name": "Saturday Cook-Up",
-  "host_id": 1,
-  "attendee_ids": [3, 5],
-  "scheduled_for": "2026-09-26T19:00:00Z",
-  "recipe": { ...one object straight from /recipes/suggest... }
-}'
-```
+On the shelf response, `needs_rescue` is `use_now` plus `expired`, and `rescue_value` adds up their prices.
 
-**The recipe is snapshotted, not referenced.** Suggestions are generated on
-demand and stored nowhere, so a foreign key would dangle the moment the
-suggestion call returned. Storing the whole object also keeps the feast honest:
-it records what people agreed to, even after pantries and preferences move on.
+### Used, wasted and rescued
 
-The host is added as an attendee automatically and starts `accepted` — they do
-not get an invitation to their own feast. Duplicate attendee ids collapse.
+Items are resolved, not deleted. `POST /grocery-items/{id}/resolve` sets `outcome` to `used` or `wasted` and records `resolved_on`. A deleted row cannot be counted as waste, so removing things from the shelf would make the waste chart look better than the truth. The older `consumed` flag still works and is kept in step with `outcome`.
 
-Endpoints: `POST /feasts`, `GET /feasts/{id}`, `GET /users/{id}/feasts`
-(`?hosting_only=true`), `POST /feasts/{id}/respond/{user_id}` (accept/decline),
-`POST /feasts/{id}/resend-invitations`.
+An item counts as a rescue when it is used while it is already in the `use_now` or `expired` band. That is decided at the moment it is resolved and stored as `rescued`, because once an item is gone its date no longer says how close a call it was. If the food was eaten at a feast, pass `feast_id` and the rescue counts as shared with friends. Without one it counts as solo. The feast has to exist and the item's owner has to be attending it.
 
-### Feast outcomes
+`GET /users/{id}/stats` returns the totals plus one bucket per week (Monday to Sunday) or calendar month, ending with the current one. Spending lands in the bucket where the item was bought. Waste and rescues land in the bucket where they were resolved. Items with no price are counted in `unpriced_items` rather than treated as free. The trend sentence compares the earliest bucket that has any spending with the latest one, so an empty bar from before the user joined does not read as 0% waste.
 
-A feast starts `planned`. The host records how it went:
+### Recipe suggestions
 
-```bash
-curl -X POST localhost:8000/feasts/4/outcome -H 'content-type: application/json' \
-     -d '{"host_id": 1, "status": "rescued"}'
-```
+`POST /recipes/suggest` takes one or more user ids and returns recipes the group could cook now. It pools everyone's unexpired, unconsumed groceries and everyone's food preferences, asks the LLM for recipes, and then checks the reply in code instead of trusting it.
 
-**Host only** — anyone else gets a 403 — and a feast cannot be set back to
-`planned`, since "it has not happened yet" is not something you learn later.
+- Allergens and diets are matched against the keyword lists in `app/dietary.py`. A suggestion that trips one is dropped, including when the ingredient is only in its "still to buy" list. The rules are pooled, so one person's peanut allergy applies to the whole table.
+- Dishes that anyone dislikes are dropped. A dislike beats a like because the meal is shared. Dislikes match by dish name, not by ingredient: someone who dislikes liver and onions has not given up onions, and excluding every ingredient of every disliked dish would rule out most of the cookbook.
+- `uses` is resolved against the real pantry, so invented ingredients disappear and each remaining one lists who actually has it. `uses_expiring` is recomputed as well, since the model once called a 300 day old bag of lentils "expiring" and that field drives the ranking.
+- Order is decided by the server: liked dishes first, then the ones that use the most expiring ingredients, then the quickest by `total_minutes`. `rank_reason` names the rule that put each recipe where it is.
 
-`rescued` also books the groceries it used: each is marked eaten and attributed
-to the feast, which is what moves it into `rescued_friends`. Which groceries?
+If nothing safe can be made, `detail` says so and `excluded_for_dietary_rules` counts what was dropped. The call runs inside the request, so it can be slow. It returns 503 if the LLM cannot be reached or replies with something that does not match the expected shape.
 
-- `item_ids` if you send them.
-- Otherwise the recipe snapshot is matched by name against the attendees'
-  shelves. The snapshot already records what the meal was made of, so it is the
-  natural source; it is also why a feast created before its ingredients were
-  added matches nothing (`uses` only ever contains things somebody had).
+### Onboarding foods
 
-Items belonging to people who are not attending are skipped rather than
-refused — a guest list can change after the recipe was chosen. Items already
-off the shelf are skipped too, so recording the outcome twice does not move an
-earlier rescue onto this feast and count it again.
+Confirming the onboarding screen saves the picks straight away and returns 202, with each food `pending`. A background task then asks the LLM for the ingredients (one call for the whole list), and each row becomes `ready`, or `failed` with the reason in `ingredient_error`. The lookup stays out of the request because these models can take a minute or more, and a request held that long gets cut off by proxies and load balancers. A failed lookup never costs the user their picks. The reply is validated against a Pydantic schema before anything is stored.
 
-**Being at a feast does not by itself make something a rescue.** The rule is
-unchanged: the item had to be in the use-now or expired band when it was eaten.
-A feast that used up a bag of rice bought yesterday was a feast, not a rescue.
-The response reports `items_used` and `items_rescued` separately so the app can
-say which happened.
+Likes and dislikes share one table, with a unique constraint on user and name, so nobody can both like and dislike the same food. If one request lists a food in both places, the first mention wins. Foods that were already saved come back in `skipped` too.
 
-**The response carries no prices.** The host acts on other attendees' groceries
-here, and `FeastOutcomeResult` has no field for what any of it cost.
+### Feasts
 
-### Invitations
+A feast is a recipe, a host and a guest list. The client posts back whichever suggestion the user picked, unchanged. The recipe is stored as a JSON snapshot rather than a reference. Suggestions are generated on demand and kept nowhere else, and the feast should keep showing what people agreed to even after their pantries change.
 
-Creating a feast writes a `notification` row per guest, then delivers them in
-the background. The row is the durable record and the user's in-app inbox:
-`GET /users/{id}/notifications` (`?unread_only=true`) and
-`POST /notifications/{id}/read`.
+`POST /feasts` checks the recipe against the allergies and diets of the actual guest list and answers 422, naming the ingredient, if it clashes. The list can differ from the group the suggestion was generated for, or someone may have added an allergy since. The host is added as an attendee who has already accepted. Each guest gets a `notification` row, and delivery is attempted in the background. That is why the create response shows `invitations_pending` above zero: read `GET /feasts/{id}` to see what actually went out.
 
-The invitation is assembled from the snapshot, so it tells each guest what to
-bring:
+Afterwards the host calls `POST /feasts/{id}/outcome` with `rescued` or `failed`. Anyone else gets a 403, and a feast cannot be set back to `planned`. On `rescued`, the groceries the meal used are marked eaten and attributed to the feast. Those are the `item_ids` you send, or by default the recipe's ingredients matched by name against the attendees' shelves. Items owned by people who are not attending are skipped, and so are items already off the shelf, so recording an outcome twice does not count anything twice.
 
-> **Sam Perera invited you to Saturday Cook-Up**
-> Sam Perera is cooking Salmon and Rocket Salad. When: Sat 26 Sep, 19:00.
-> Takes about 15 minutes. Bringing: Theo Alvarez — Salmon fillet, Rocket;
-> Mei Tanaka — Spring onions; Sam Perera — Greek yogurt, Olive oil.
-> Still to buy: lemon juice.
+Being at a feast does not by itself make something a rescue. The item still has to have been in the `use_now` or `expired` band when it was eaten. The response reports `items_used` and `items_rescued` separately, and it never includes prices, since the host is acting on other people's groceries.
 
-**Delivery is decoupled from creation.** A slow or broken channel must not stop
-a feast being created, so sending happens after the response. That is why
-`POST /feasts` returns `invitations_pending: 2, invitations_sent: 0` — read
-`GET /feasts/{id}` for what actually went out. A channel that throws marks its
-row `failed` with the reason in `delivery_error`; `resend-invitations` retries
-only rows that are not yet `sent`, so it can be run repeatedly without
-double-inviting anyone.
+### Notifications
 
-**Channels.** No email or push provider is configured here, so the default
-channel writes the invitation to the application log and marks the row sent.
-Set `NOTIFICATION_CHANNEL=null` to disable, or add a real channel to `CHANNELS`
-in `app/notifications.py` — the inbox, retry and failure handling are already
-in place around it.
+Every invitation is written to the `notification` table first. That row is the guest's in-app inbox entry and the delivery record. A channel then tries to push it somewhere external. If the channel fails, the row is marked `failed` with the error in `delivery_error`, and `resend-invitations` retries only the rows that are not yet `sent`. Running it repeatedly never invites anyone twice.
+
+`NOTIFICATION_CHANNEL` picks the channel:
+
+- `log` writes the invitation to the application log and marks it sent. This is the default.
+- `null` sends nothing.
+- `expo` sends a push through Expo. Clients register their device with `POST /users/{id}/push-token`, and the channel needs the `exponent-server-sdk` package (`pip install exponent-server-sdk`). Users with no token are skipped, and their row is still marked `sent` because the inbox already has the message.
+
+To add another channel, write a class with a `send(self, *, to, title, body)` method and register it in `CHANNELS` in `app/notifications.py`. The inbox, retries and failure handling already wrap it.
 
 ## Demo data
 
 ```bash
 python -m scripts.seed                # skips if already seeded
-python -m scripts.seed --reset        # wipe demo data and redo
-python -m scripts.seed --with-foods   # also seed food preferences (makes real LLM calls)
-python -m scripts.seed --with-feasts  # also plan feasts and send invitations
+python -m scripts.seed --reset        # remove the demo accounts and start again
+python -m scripts.seed --with-foods   # also add food preferences (real LLM calls)
+python -m scripts.seed --with-feasts  # also plan feasts and send invitations (implies --with-foods)
 ```
 
-5 users, 31 grocery items and 6 friendships in assorted states. `--with-foods`
-adds 11 food preferences (7 likes, 4 dislikes); `--with-feasts` adds 2 feasts
-with 6 attendees and 4 delivered invitations, one guest accepting and one
-declining on each. Both are opt-in because filling them in means real (billed)
-LLM calls.
+The base seed creates seven users with a few dozen groceries between them, and friendships in every state: accepted, pending and blocked. Every demo account uses the password `fridge-friends-demo`. Five of them have emails on `@grocerydemo.dev` (User IDs `sam.perera`, `nadia.k`, `theo.a`, `mei.t` and `obi.n`), and two were created the way the join screen creates them, with no email (`pantry.pal` and `rae.cooks`). Several carry a taste profile so you can see allergen filtering work: Nadia is vegetarian and allergic to peanuts, Mei avoids shellfish, and Obi is dairy-free.
 
-`--with-feasts` picks each feast's recipe by running the real suggestion logic
-against the seeded pantries, so the stored snapshot is a genuine suggestion
-rather than a hand-written fake — and it works on an already-seeded database,
-since feasts depend only on the users and their groceries. Expiry dates
-are **relative to the day you run it**, so a handful of items are always
-expired, expiring today, and expiring this week — the `/expiring` endpoints
-stay interesting without re-seeding.
+Expiry dates are relative to the day you run the script, so there are always items that are expired, expiring today and expiring this week.
 
-Every demo account shares the password `fridge-friends-demo` (User IDs
-`sam.perera`, `nadia.k`, `theo.a`, `mei.t`, `obi.n`), so the join screen can be
-exercised against seeded data. Two accounts carry a taste profile, which is
-what makes the allergen filtering visible: Nadia is vegetarian and allergic to
-peanuts, Mei avoids shellfish, Obi is dairy-free.
+`--with-foods` and `--with-feasts` are opt-in because they make real, billed LLM calls. Feasts are planned by running the real suggestion logic against the seeded pantries, so the stored recipes are not hand-written fakes, and the flag also works on a database that was already seeded.
 
-Every demo account is on `@grocerydemo.dev`, and `--reset` deletes only those
-accounts. It never truncates tables, so it is safe to run against a database
-that also holds real rows.
+`--reset` only deletes the demo accounts. It never truncates tables, so it is safe on a database that also holds real rows.
 
-## Migrations
+## Project layout
 
-Alembic owns the schema; the app does **not** create tables at startup, so a new
-checkout (or a deploy) needs `alembic upgrade head`.
+```
+app/
+  main.py            app setup, CORS, router registration, /health
+  database.py        engine and sessions, .env loading, URL normalising
+  models.py          SQLModel tables and enums
+  schemas.py         request and response models
+  services.py        shelf, stats, pantry and feast logic shared by routers
+  freshness.py       shelf-life catalogue and freshness bands
+  dietary.py         allergen and diet rules
+  llm.py             OpenAI-compatible client, prompts, reply validation
+  notifications.py   delivery channels and invitation wording
+  security.py        password hashing
+  routers/           auth, users, groceries, friends, onboarding, recipes, feasts
+migrations/          Alembic environment and versions
+scripts/             seed.py and check_llm.py
+tests/               pytest suite
+```
+
+There are seven tables: `app_user` (named that because `user` is reserved in Postgres), `grocery_item`, `friend`, `food_preference`, `feast`, `feast_attendee` and `notification`. Lists that are short, fixed and always read with their owner, such as a user's diets and allergens, are JSON columns instead of join tables. On Postgres the JSON columns are JSONB, so the stored ingredients can be queried directly.
+
+## Database and migrations
+
+Alembic owns the schema. The app does not create tables when it starts, so a fresh checkout or a new deploy needs `alembic upgrade head`.
 
 ```bash
-alembic upgrade head                              # apply everything
-alembic revision --autogenerate -m "add x"        # after editing app/models.py
-alembic check                                     # models vs. DB drift, no changes made
-alembic downgrade -1                              # step back one
-alembic history                                   # what exists
+alembic upgrade head                        # apply everything
+alembic revision --autogenerate -m "add x"  # after editing app/models.py
+alembic check                               # compare models with the database
+alembic downgrade -1                        # step back one revision
+alembic history                             # list what exists
 ```
 
-The connection string comes from `app.database` (i.e. `.env`) — `alembic.ini`
-has no URL in it, so there is one place to change and no credential in a
-tracked file.
+The connection string comes from `app.database`, which reads `.env`. `alembic.ini` has no URL, so there is one place to change it and no credential in a tracked file.
 
-Always read an autogenerated migration before applying it. Autogenerate is good
-at tables, columns and indexes, and weak at renames (it sees a drop plus an add)
-and at anything needing a data backfill. The `food_preference` migration is
-hand-written for exactly that reason — autogenerating the `favorite_food`
-rename would have dropped every row.
+A few things to know before you write a migration:
 
-The history here is not linear by accident: `d82a3e9a4925` was written in a
-second working copy of this repo and applied to Supabase without being
-committed, so `c4a17e9b52d1` was rebased onto it rather than branching from the
-same parent. Keep new revisions on one chain — alembic cannot upgrade a
-database sitting on a revision it has never heard of.
+- Read every autogenerated migration before you apply it. Autogenerate handles tables, columns and indexes well. It sees a rename as a drop plus an add and cannot backfill data, which is why the `food_preference` migration is written by hand.
+- SQLite cannot alter a column, so `migrations/env.py` turns on batch mode for SQLite only. Batch mode rebuilds a table by dropping it, which fires `ON DELETE CASCADE` and can quietly empty child tables. Revision `c4a17e9b52d1` switches foreign keys off around its batch operations for that reason.
+- Postgres keeps an enum type after its table is dropped, so the initial migration's `downgrade()` drops `friendstatus` explicitly.
+- Keep new revisions on one chain. Alembic cannot upgrade a database that sits on a revision it has never seen. `alembic heads` should list exactly one.
 
-Three gotchas already handled. SQLite can't `ALTER` a column, so `env.py` turns
-on `render_as_batch` for SQLite only. Postgres keeps an enum type after its
-table is dropped, so the initial migration's `downgrade()` drops `friendstatus`
-explicitly. And batch mode on SQLite rebuilds a table by dropping it — which
-fires `grocery_item`'s `ON DELETE CASCADE` and silently empties the table — so
-`c4a17e9b52d1` turns foreign keys off around its batch operations, inside an
-`autocommit_block()` because SQLite ignores that PRAGMA within a transaction.
-
-## Profile photos
-
-`avatar_url` is a nullable string on `UserRead` and `UserUpdate`:
+## Testing
 
 ```bash
-curl -X PATCH localhost:8000/users/1 -H 'content-type: application/json' \
-     -d '{"avatar_url": "https://example.com/me.jpg"}'
+pytest
 ```
 
-Send `null` or `""` to clear it and fall back to the `buddy` sprite. Only
-`http://` and `https://` links are accepted — the app renders this straight
-into an image tag, so `javascript:` and `data:` URLs are refused here rather
-than trusted downstream.
+The suite takes a few seconds. Every test gets a fresh in-memory SQLite database with foreign keys switched on, since SQLite ignores them by default and would hide cascade behaviour that Postgres applies. Tests never touch the database in your `.env`. An autouse fixture makes any test that reaches the real LLM client fail immediately, so stub `app.llm.call_model` in tests that need a model reply.
 
-**This stores a link, not a file.** There is no upload endpoint, because there
-is no object storage wired up to put the bytes in: that needs an S3 or Supabase
-Storage bucket, credentials, and a signed-upload flow. Point this at whatever
-you already use for image hosting, or say the word and it can be added once a
-bucket exists.
+## Security and known limitations
 
-## CORS
+- There are no session tokens. `POST /auth/login` checks the password and returns the user, and every other endpoint trusts the `user_id` in the URL. Anyone who can reach the API can act as any user. Add token issuing to `app/routers/auth.py` and an auth dependency on the other routers before you expose this beyond a trusted network. The stored credentials are already in the right shape for it.
+- Passwords are hashed with PBKDF2-HMAC-SHA256 (240,000 iterations, a salt per password, standard library only) and never returned by the API.
+- `CORS_ORIGINS` defaults to `*`, which allows any origin and disables credentials. Set an explicit list in production. If a browser front end on another origin cannot reach the API, check this first: without CORS the preflight `OPTIONS` request gets a 405, the real request is never sent, and the server logs stay empty, which looks exactly like the backend being down.
+- Background work (ingredient lookups and invitation delivery) runs inside the API process. If the process restarts mid-job, rows stay `pending`. Use `refresh-ingredients` and `resend-invitations` to pick them up again.
+- Avatars are stored as links, not files. `avatar_url` accepts only `http://` and `https://` addresses, and there is no upload endpoint because no object storage is set up.
+- Recipe suggestions wait on the LLM inside the request. Slow models push the response time up to `LLM_TIMEOUT_SECONDS`.
 
-A browser front end on another origin needs this, and the symptom when it is
-missing is misleading: the preflight `OPTIONS` comes back `405`, the browser
-never sends the real request, and the server logs stay empty — so it reads as
-"the backend is unreachable" when the backend is fine.
+## License
 
-`CORS_ORIGINS` is a comma-separated list of allowed origins and defaults to
-`*`. Credentials are only enabled when an explicit list is given: the spec
-forbids pairing `allow_credentials` with `*`, and browsers reject that
-combination outright rather than falling back to something weaker.
-
-```bash
-CORS_ORIGINS=http://localhost:3000,https://fridge-friends.example
-```
-
-## Notes
-
-`LLM_MODEL` is whatever your endpoint serves — currently `openai/gpt-oss-20b`
-on NVIDIA NIM, which answers in a few seconds. The code is provider-agnostic:
-any OpenAI-compatible `LLM_BASE_URL` works, and switching models is a one-line
-change in `.env`. (`z-ai/glm-5.3` is listed by that endpoint but never
-responded during development — requests disconnect at 60s.)
-
-Passwords are stored and checked, but there are no session tokens yet:
-`user_id` in the path is still the acting user, and no endpoint verifies who is
-calling. Add a token and an auth dependency before exposing this beyond local
-use.
+MIT. See [LICENSE](LICENSE).
